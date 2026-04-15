@@ -12,3 +12,4 @@ round,optimization,latency_ms,tflops,mfu_pct,accepted,notes
 10,Q from global/L2 (remove Q_s smem),52.137,15.82,13.8,no,regression: repeated L2 reads > occupancy gain; reverted
 11,warp-level mask skip (per-warp OR check),50.358,16.38,14.2,no,marginal; check overhead offsets savings at 61.7% density; reverted
 12,BN=64 + NWARPS=4 (halve tiles again),60.433,13.63,11.9,no,regression: occupancy loss from 80KB smem; reverted
+13,two-pass softmax (eliminate vals[] stack),58.818,14.02,12.2,no,regression: extra smem reads > register savings; reverted
