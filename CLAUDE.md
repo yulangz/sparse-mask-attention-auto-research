@@ -24,16 +24,12 @@ python run.py                       # runs correctness + perf (default --mode al
 
 ## Architecture
 
-CUDA kernel for sparse masked attention optimized for short sequences (<1K tokens) with high sparsity (~75%). Tested on RTX 3080 (sm_86).
+CUDA kernel for sparse masked attention.
 
-**Key optimizations:**
-- Bit-packs bool mask `[B,H,N,N]` → uint32 `[B,H,N,N/32]` (8x memory savings)
-- WMMA m16n16k16 Tensor Core for both QK^T and PV accumulation
-- Register-resident online softmax with `__shfl_xor_sync` cross-lane reduction (no smem round-trip)
-- smem padding (+8 halves) to eliminate bank conflicts
-- cp.async for K/V loading, mask preloaded to smem
+The sparsity pattern is based on standard decode attention (causal mask over preceding KV), where each query only attends to a random subset of up to 2048 preceding KV positions. If a query has fewer than 2048 preceding positions, it attends to all of them.
 
-**Kernel parameters:** BM=16, BN=64, HD=64, 4 warps/block (128 threads), FP16 I/O with FP32 accumulation.
+The sparse attention implementation assumes N varies (tested N in [64, 128, 256, 512] for correctness; up to 16384 for perf). Mask shape is always `[B,H,N,N]` and must match the sequence length N of Q/K/V.
+
 
 ### File roles
 
