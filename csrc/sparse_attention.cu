@@ -65,8 +65,9 @@ void pack_mask_bits(
 #define WK 16
 #define WMMA_N 16       // WMMA N dimension (fixed)
 #define BN 32           // KV tile size (= 2 WMMA tiles = 1 mask word)
-#define NWARPS 4
-#define BM (WM * NWARPS) // 64
+#define NWARPS 8
+#define BM (WM * NWARPS) // 128
+#define BN_SUBTILES (BN / WMMA_N)  // 2
 
 __global__ void sparse_attn_wmma_fp16(
     const __half* __restrict__ Q,
