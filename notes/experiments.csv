@@ -1,0 +1,2 @@
+round,optimization,latency_ms,tflops,mfu_pct,accepted,notes
+0,baseline (scalar 1-warp/row),444.392,1.86,1.6,yes,B=1 N=16384 H=12 D=64 FP16 on L20Y
