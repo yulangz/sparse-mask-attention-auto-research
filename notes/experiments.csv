@@ -6,3 +6,4 @@ round,optimization,latency_ms,tflops,mfu_pct,accepted,notes
 4,column-split 16 warps/row (no smem K/V),236.900,3.48,3.0,no,neutral vs R2; more L2 traffic offsets sync savings; reverted
 5,WMMA TC kernel BN=16 (smem O accumulation),231.215,3.57,3.1,yes,marginal; WMMA fast but BN=16 doubles tile count overhead
 6,WMMA BN=32 (halved tiles + split P@V),140.345,5.88,5.1,yes,1.65x over R5; 3.17x vs baseline; halved tile overhead key
+7,block-level mask skip (OR across warps),141.473,5.83,5.1,no,skip rarely fires at 61.7% density; overhead ~neutral; reverted
