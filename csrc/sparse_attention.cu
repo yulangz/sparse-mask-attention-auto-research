@@ -90,20 +90,41 @@ __global__ void sparse_attn_wmma_fp16(
     const int n_words = (N + 31) / 32;
     const int D_CHUNKS = D / WK;  // 4 for D=64
 
-    /* -------- shared memory layout -------- */
+    /* -------- shared memory layout (no O_s needed) -------- */
     extern __shared__ char smem[];
     __half* Q_s = (__half*)smem;                                    // [BM, D]
     __half* K_s = Q_s + BM * D;                                    // [BN, D]
     __half* V_s = K_s + BN * D;                                    // [BN, D]
     float*  S_s = (float*)(V_s + BN * D);                          // [NWARPS, WM, BN]
     __half* P_s = (__half*)(S_s + NWARPS * WM * BN);               // [NWARPS, WM, BN]
-    float*  O_s = (float*)(P_s + NWARPS * WM * BN);                // [NWARPS, WM, D]
 
-    /* -------- init O -------- */
-    for (int i = threadIdx.x; i < NWARPS * WM * D; i += blockDim.x)
-        O_s[i] = 0.0f;
+    /* -------- determine fragment row mapping (one-time, arch-independent) -------- */
+    // Use WMMA to compute C = Identity × RowIndex → C[i,j] = i (row of each element)
+    __half* tmpA = Q_s;         // reuse Q_s before Q is loaded (need 256 halfs)
+    __half* tmpB = Q_s + 256;   // next 256 halfs
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+        int r = i / 16, c = i % 16;
+        tmpA[i] = __float2half((r == c) ? 1.0f : 0.0f);  // identity
+        tmpB[i] = __float2half((float)r);                  // B[k,j] = k
+    }
+    __syncthreads();
 
-    /* -------- load Q once -------- */
+    wmma::fragment<wmma::accumulator, WM, WMMA_N, WK, float> map_frag;
+    {
+        wmma::fragment<wmma::matrix_a, WM, WMMA_N, WK, __half, wmma::row_major> mA;
+        wmma::fragment<wmma::matrix_b, WM, WMMA_N, WK, __half, wmma::row_major> mB;
+        wmma::load_matrix_sync(mA, tmpA, 16);
+        wmma::load_matrix_sync(mB, tmpB, 16);
+        wmma::fill_fragment(map_frag, 0.0f);
+        wmma::mma_sync(map_frag, mA, mB, map_frag);
+    }
+    int elem_rows[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        elem_rows[i] = __float2int_rn(map_frag.x[i]);
+    __syncthreads();
+
+    /* -------- load Q -------- */
     for (int i = threadIdx.x; i < BM * D; i += blockDim.x) {
         int r = i / D, d = i % D;
         int gr = blockIdx.x * BM + r;
@@ -117,6 +138,11 @@ __global__ void sparse_attn_wmma_fp16(
     const int grow  = row_start + srow;
     float running_max = -FLT_MAX;
     float running_sum = 0.0f;
+
+    /* -------- O accumulator in WMMA fragments -------- */
+    wmma::fragment<wmma::accumulator, WM, WMMA_N, WK, float> O_acc[4]; // D/16 chunks
+    for (int d = 0; d < D_CHUNKS; d++)
+        wmma::fill_fragment(O_acc[d], 0.0f);
 
     /* -------- tile over KV columns (BN=32, one mask word) -------- */
     for (int tile = 0; tile < n_words; tile++) {
@@ -200,65 +226,65 @@ __global__ void sparse_attn_wmma_fp16(
         running_sum = running_sum * alpha + tile_sum;
         running_max = new_max;
 
-        /* -- rescale O_s by alpha -- */
-        float* my_O = &O_s[warp_id * WM * D];
-        if (grow < N) {
-            int d_start = shalf * 32;
-            for (int d = 0; d < 32; d++)
-                my_O[srow * D + d_start + d] *= alpha;
+        /* -- rescale O_acc fragments by alpha -- */
+        // Share alpha via smem (reuse S_s area for this warp)
+        float* alpha_buf = my_S;  // only need 16 floats, S_s has 512 per warp
+        if (shalf == 0) alpha_buf[srow] = alpha;
+        __syncwarp();
+
+        // Fragment layout (m16n16k16 acc): thread group g=lane/4 handles rows 2g, 2g+1
+        // Use runtime-discovered mapping instead of hardcoded assumption
+        #pragma unroll
+        for (int d = 0; d < D_CHUNKS; d++) {
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+                O_acc[d].x[i] *= alpha_buf[elem_rows[i]];
         }
         __syncwarp();
 
-        /* -- WMMA: O += P × V  (split P left/right, V top/bottom) -- */
-        float* temp_buf = my_S;  // reuse S_s area (512 floats available, need 256)
-
+        /* -- WMMA: O_acc += P × V  (accumulate directly) -- */
         #pragma unroll
         for (int dc = 0; dc < D_CHUNKS; dc++) {
-            wmma::fragment<wmma::accumulator, WM, WMMA_N, WK, float> Ofrag;
-            wmma::fill_fragment(Ofrag, 0.0f);
-
-            // P_left[16,16] × V_top[16,16]
             wmma::fragment<wmma::matrix_a, WM, WMMA_N, WK, __half, wmma::row_major> Pl, Pr;
             wmma::fragment<wmma::matrix_b, WM, WMMA_N, WK, __half, wmma::row_major> Vt, Vb;
 
-            wmma::load_matrix_sync(Pl, &P_s[warp_id * WM * BN],      BN);  // cols 0-15
-            wmma::load_matrix_sync(Vt, &V_s[dc * WK],                 D);  // rows 0-15
+            wmma::load_matrix_sync(Pl, &P_s[warp_id * WM * BN],      BN);
+            wmma::load_matrix_sync(Vt, &V_s[dc * WK],                 D);
+            wmma::load_matrix_sync(Pr, &P_s[warp_id * WM * BN + 16], BN);
+            wmma::load_matrix_sync(Vb, &V_s[16 * D + dc * WK],        D);
 
-            wmma::load_matrix_sync(Pr, &P_s[warp_id * WM * BN + 16], BN);  // cols 16-31
-            wmma::load_matrix_sync(Vb, &V_s[16 * D + dc * WK],        D);  // rows 16-31
-
-            wmma::mma_sync(Ofrag, Pl, Vt, Ofrag);
-            wmma::mma_sync(Ofrag, Pr, Vb, Ofrag);
-
-            // store to temp, add to O_s
-            wmma::store_matrix_sync(temp_buf, Ofrag, WMMA_N, wmma::mem_row_major);
-            __syncwarp();
-
-            if (grow < N) {
-                int d_base = shalf * 8;
-                for (int i = 0; i < 8; i++)
-                    my_O[srow * D + dc * WK + d_base + i] += temp_buf[srow * WMMA_N + d_base + i];
-            }
-            __syncwarp();
+            wmma::mma_sync(O_acc[dc], Pl, Vt, O_acc[dc]);
+            wmma::mma_sync(O_acc[dc], Pr, Vb, O_acc[dc]);
         }
 
         __syncthreads();
     }
 
-    /* -------- write output -------- */
-    float* my_O = &O_s[warp_id * WM * D];
-    if (grow < N) {
-        float inv = (running_sum > 0.0f) ? (1.0f / running_sum) : 0.0f;
-        int d_start = shalf * 32;
-        for (int d = 0; d < 32; d++) {
-            float v = my_O[srow * D + d_start + d] * inv;
-            Out[bhND + grow * D + d_start + d] = __float2half(v);
+    /* -------- write output (sequential per warp using S_s as temp) -------- */
+    for (int w = 0; w < NWARPS; w++) {
+        if (warp_id == w) {
+            float* O_buf = S_s;  // reuse S_s (2048 floats, need 1024)
+            #pragma unroll
+            for (int d = 0; d < D_CHUNKS; d++)
+                wmma::store_matrix_sync(&O_buf[d * WMMA_N], O_acc[d], D,
+                                        wmma::mem_row_major);
+            __syncwarp();
+
+            if (grow < N) {
+                float inv = (running_sum > 0.0f) ? (1.0f / running_sum) : 0.0f;
+                int d_start = shalf * 32;
+                for (int d = 0; d < 32; d++) {
+                    float v = O_buf[srow * D + d_start + d] * inv;
+                    Out[bhND + grow * D + d_start + d] = __float2half(v);
+                }
+                if (is_training && shalf == 0) {
+                    int idx = (b * H + h) * N + grow;
+                    lse[idx] = (running_sum > 0.0f)
+                             ? (running_max + logf(running_sum)) : -FLT_MAX;
+                }
+            }
         }
-        if (is_training && shalf == 0) {
-            int idx = (b * H + h) * N + grow;
-            lse[idx] = (running_sum > 0.0f)
-                     ? (running_max + logf(running_sum)) : -FLT_MAX;
-        }
+        __syncthreads();
     }
 }
 
@@ -356,8 +382,7 @@ void sparse_attention_fwd_fp16(
                    + BN * D * 2                 // K_s
                    + BN * D * 2                 // V_s
                    + NWARPS * WM * BN * 4       // S_s
-                   + NWARPS * WM * BN * 2       // P_s
-                   + NWARPS * WM * D * 4;       // O_s
+                   + NWARPS * WM * BN * 2;      // P_s
 
     sparse_attn_wmma_fp16<<<grid, block, smem_bytes, stream>>>(
         (const __half*)params.q, (const __half*)params.k,

@@ -7,3 +7,4 @@ round,optimization,latency_ms,tflops,mfu_pct,accepted,notes
 5,WMMA TC kernel BN=16 (smem O accumulation),231.215,3.57,3.1,yes,marginal; WMMA fast but BN=16 doubles tile count overhead
 6,WMMA BN=32 (halved tiles + split P@V),140.345,5.88,5.1,yes,1.65x over R5; 3.17x vs baseline; halved tile overhead key
 7,block-level mask skip (OR across warps),141.473,5.83,5.1,no,skip rarely fires at 61.7% density; overhead ~neutral; reverted
+8,fragment O_acc + runtime row mapping (no smem O),53.139,15.52,13.4,yes,2.64x over R6! Eliminated O smem round-trip; 8.36x vs baseline
