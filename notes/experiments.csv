@@ -4,3 +4,4 @@ round,optimization,latency_ms,tflops,mfu_pct,accepted,notes
 2,increase BLOCK_M to 16 (16 warps 512 threads),236.614,3.49,3.0,yes,1.88x vs baseline
 3,BLOCK_N=128 larger tiles + word skip,252.084,3.27,2.8,no,regression: larger smem hurt occupancy; reverted
 4,column-split 16 warps/row (no smem K/V),236.900,3.48,3.0,no,neutral vs R2; more L2 traffic offsets sync savings; reverted
+5,WMMA TC kernel BN=16 (smem O accumulation),231.215,3.57,3.1,yes,marginal; WMMA fast but BN=16 doubles tile count overhead
