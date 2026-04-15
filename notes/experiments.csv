@@ -13,3 +13,4 @@ round,optimization,latency_ms,tflops,mfu_pct,accepted,notes
 11,warp-level mask skip (per-warp OR check),50.358,16.38,14.2,no,marginal; check overhead offsets savings at 61.7% density; reverted
 12,BN=64 + NWARPS=4 (halve tiles again),60.433,13.63,11.9,no,regression: occupancy loss from 80KB smem; reverted
 13,two-pass softmax (eliminate vals[] stack),58.818,14.02,12.2,no,regression: extra smem reads > register savings; reverted
+14,NWARPS=6 (occupancy sweet spot test),52.616,15.68,13.6,no,regression: less K/V sharing > occupancy gain; reverted
