@@ -62,7 +62,7 @@ void pack_mask_bits(
 // Online softmax in FP32 for numerical stability.
 // ============================================================
 
-#define BLOCK_M 4
+#define BLOCK_M 16
 #define BLOCK_N 32
 
 template <typename T>
