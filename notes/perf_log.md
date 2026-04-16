@@ -144,6 +144,28 @@ FlashInfer:     71.20ms  ( 12 TFLOPS)  sparse     ← 3.19× slower
 Baseline:      444.39ms  (  2 TFLOPS)  scalar     ← 19.9× slower
 ```
 
+## Rounds 30-32: Rejected Attempts
+- **R30**: BN_TILE=64 → 21.0ms kernel (worse, reverted)
+- **R30b**: BN_TILE=256 → 22.8ms kernel (worse, smem pressure)
+- **R31**: launch_bounds(256,3) → 80 regs, 340B spills → 23.2ms (worse)
+- **R32**: NWARPS=16 (BM=256) → 20.8ms kernel (slightly worse, less scheduling flexibility)
+BN_TILE=128, NWARPS=8, 2 blocks/SM remains optimal.
+
+## Summary: Rounds 24-32
+
+| Round | Optimization | Kernel (ms) | Total (ms) | Status |
+|-------|-------------|-------------|------------|--------|
+| R24 | S_s/P_s smem padding | 28.0 | 41.5 | ACCEPT |
+| R25 | In-register softmax + direct output | 26.1 | 39.6 | ACCEPT |
+| R26 | BN_TILE=64 (2x sub-tiles) | 24.2 | 37.7 | ACCEPT |
+| R27 | BN_TILE=128 (4x sub-tiles) | 23.3 | 36.8 | ACCEPT |
+| R28 | Vectorized pack_mask (__ballot_sync) | 23.3 | 25.3 | ACCEPT |
+| R29 | launch_bounds + occupancy fix | **20.4** | **22.3** | ACCEPT |
+| R30-32 | BN_TILE/NWARPS/occupancy sweeps | — | — | REJECT |
+
+**Current best**: 22.3ms total / 20.4ms kernel — **19.9× vs baseline, parity with Triton**
+From 444.4ms → 22.3ms over 32 optimization rounds.
+
 **Key breakthroughs** (in order of impact):
 1. **R8**: Fragment O accumulation w/ runtime row mapping (140→53ms, 2.6x single-round gain)
 2. **R6**: WMMA BN=32 (231→140ms, 1.65x) 

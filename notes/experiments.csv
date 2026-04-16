@@ -32,3 +32,4 @@ round,optimization,latency_ms,tflops,mfu_pct,accepted,notes
 29,launch_bounds(256 2) + no sub-tile unroll,22.339,36.91,32.1,yes,kernel 20.4ms! 128 regs 2 blocks/SM; total 22.3ms; 19.88x vs baseline
 30,BN_TILE=64 and BN_TILE=256,varies,,,,both worse than BN_TILE=128; rejected
 31,launch_bounds(256 3) → 80 regs + heavy spill,23.169,,,,spills outweigh occupancy gain; reverted to 2 blocks/SM
+32,NWARPS=16 (BM=256 1 block/SM),20.818,,,,no gain over NWARPS=8+2blocks; slightly worse scheduling; reverted
