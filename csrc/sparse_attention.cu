@@ -1,8 +1,10 @@
 /**
  * Sparse Mask Attention - CUDA Implementation
  *
- * WMMA FP16 kernel: tensor-core QK^T and P@V, online softmax,
- * O accumulated in shared memory. BN=32 columns per KV tile.
+ * WMMA FP16 kernel with:
+ * - Double-buffered K/V with cp.async prefetch
+ * - Tensor-core QK^T and P@V
+ * - In-fragment O accumulation with runtime row mapping
  * Scalar BF16 fallback.
  */
 
@@ -11,6 +13,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_pipeline.h>
 #include <mma.h>
 #include <float.h>
 #include <math.h>
@@ -52,22 +55,40 @@ void pack_mask_bits(
 }
 
 // ============================================================
-// WMMA FP16 Forward Kernel  (BN=32)
-//
-// Block: 4 warps (128 threads), each warp owns 16 Q rows.
-// KV tile = 32 columns (two WMMA-N tiles, aligned with mask word).
-// QK^T: 2×4 = 8 WMMA ops per tile.
-// P@V : 2×4 = 8 WMMA ops per tile (P split left/right, V top/bottom).
-// Online softmax, O accumulated in smem.
+// WMMA FP16 Forward — double-buffered K/V with cp.async
 // ============================================================
 
 #define WM 16
 #define WK 16
-#define WMMA_N 16       // WMMA N dimension (fixed)
-#define BN 32           // KV tile size (= 2 WMMA tiles = 1 mask word)
+#define WMMA_N 16
+#define BN 32
 #define NWARPS 8
-#define BM (WM * NWARPS) // 128
-#define BN_SUBTILES (BN / WMMA_N)  // 2
+#define BM (WM * NWARPS)
+#define D_CHUNKS 4
+
+// Helper: issue cp.async for one K/V tile into smem buffer
+__device__ __forceinline__ void prefetch_kv_tile(
+    __half* K_dst, __half* V_dst,
+    const __half* K_src_base, const __half* V_src_base,
+    int col0, int N, int D, int bhND
+) {
+    const int n_vec = (BN * D) / 8;
+    float4* K4 = (float4*)K_dst;
+    float4* V4 = (float4*)V_dst;
+    const float4* Ks = (const float4*)(K_src_base + bhND + col0 * D);
+    const float4* Vs = (const float4*)(V_src_base + bhND + col0 * D);
+    const float4 z4 = {0.f, 0.f, 0.f, 0.f};
+    for (int i = threadIdx.x; i < n_vec; i += blockDim.x) {
+        int gc = col0 + (i * 8) / D;
+        if (gc < N) {
+            __pipeline_memcpy_async(&K4[i], &Ks[i], 16);
+            __pipeline_memcpy_async(&V4[i], &Vs[i], 16);
+        } else {
+            K4[i] = z4;
+            V4[i] = z4;
+        }
+    }
+}
 
 __global__ void sparse_attn_wmma_fp16(
     const __half* __restrict__ Q,
@@ -89,97 +110,87 @@ __global__ void sparse_attn_wmma_fp16(
 
     const int bhND = ((b * H + h) * N) * D;
     const int n_words = (N + 31) / 32;
-    const int D_CHUNKS = D / WK;  // 4 for D=64
 
-    /* -------- shared memory layout (no O_s needed) -------- */
+    /* -------- shared memory: double-buffered K/V -------- */
     extern __shared__ char smem[];
-    __half* Q_s = (__half*)smem;                                    // [BM, D]
-    __half* K_s = Q_s + BM * D;                                    // [BN, D]
-    __half* V_s = K_s + BN * D;                                    // [BN, D]
-    float*  S_s = (float*)(V_s + BN * D);                          // [NWARPS, WM, BN]
-    __half* P_s = (__half*)(S_s + NWARPS * WM * BN);               // [NWARPS, WM, BN]
+    __half* Q_s   = (__half*)smem;                                  // [BM, D]
+    __half* K_buf = Q_s + BM * D;                                  // [2, BN, D]
+    __half* V_buf = K_buf + 2 * BN * D;                            // [2, BN, D]
+    float*  S_s   = (float*)(V_buf + 2 * BN * D);                  // [NWARPS, WM, BN]
+    __half* P_s   = (__half*)(S_s + NWARPS * WM * BN);             // [NWARPS, WM, BN]
 
-    /* -------- determine fragment row mapping (one-time, arch-independent) -------- */
-    // Use WMMA to compute C = Identity × RowIndex → C[i,j] = i (row of each element)
-    __half* tmpA = Q_s;         // reuse Q_s before Q is loaded (need 256 halfs)
-    __half* tmpB = Q_s + 256;   // next 256 halfs
+    /* -------- fragment row mapping -------- */
+    __half* tmpA = Q_s;
+    __half* tmpB = Q_s + 256;
     for (int i = threadIdx.x; i < 256; i += blockDim.x) {
         int r = i / 16, c = i % 16;
-        tmpA[i] = __float2half((r == c) ? 1.0f : 0.0f);  // identity
-        tmpB[i] = __float2half((float)r);                  // B[k,j] = k
+        tmpA[i] = __float2half((r == c) ? 1.0f : 0.0f);
+        tmpB[i] = __float2half((float)r);
     }
     __syncthreads();
 
-    wmma::fragment<wmma::accumulator, WM, WMMA_N, WK, float> map_frag;
+    int elem_rows[8];
     {
         wmma::fragment<wmma::matrix_a, WM, WMMA_N, WK, __half, wmma::row_major> mA;
         wmma::fragment<wmma::matrix_b, WM, WMMA_N, WK, __half, wmma::row_major> mB;
+        wmma::fragment<wmma::accumulator, WM, WMMA_N, WK, float> mC;
         wmma::load_matrix_sync(mA, tmpA, 16);
         wmma::load_matrix_sync(mB, tmpB, 16);
-        wmma::fill_fragment(map_frag, 0.0f);
-        wmma::mma_sync(map_frag, mA, mB, map_frag);
+        wmma::fill_fragment(mC, 0.0f);
+        wmma::mma_sync(mC, mA, mB, mC);
+        #pragma unroll
+        for (int i = 0; i < 8; i++) elem_rows[i] = __float2int_rn(mC.x[i]);
     }
-    int elem_rows[8];
-    #pragma unroll
-    for (int i = 0; i < 8; i++)
-        elem_rows[i] = __float2int_rn(map_frag.x[i]);
     __syncthreads();
 
-    /* -------- load Q (vectorized float4) -------- */
+    /* -------- load Q -------- */
     {
         const int n_vec = (BM * D) / 8;
-        const float4 zero4 = {0.0f, 0.0f, 0.0f, 0.0f};
-        float4* Q_s4 = (float4*)Q_s;
-        const float4* Q_src = (const float4*)(Q + bhND + blockIdx.x * BM * D);
+        const float4 z4 = {0.f, 0.f, 0.f, 0.f};
+        float4* Q4 = (float4*)Q_s;
+        const float4* Qs = (const float4*)(Q + bhND + blockIdx.x * BM * D);
         for (int i = threadIdx.x; i < n_vec; i += blockDim.x) {
-            int kn = (i * 8) / D;
-            int gr = blockIdx.x * BM + kn;
-            Q_s4[i] = (gr < N) ? Q_src[i] : zero4;
+            int gr = blockIdx.x * BM + (i * 8) / D;
+            Q4[i] = (gr < N) ? Qs[i] : z4;
         }
     }
+
+    /* -------- prefetch tile 0 into buffer 0 -------- */
+    prefetch_kv_tile(K_buf, V_buf, K, V, 0, N, D, bhND);
+    __pipeline_commit();
+    __pipeline_wait_prior(0);
     __syncthreads();
 
     /* -------- per-row running state -------- */
-    const int srow  = lane_id / 2;          // 0..15
-    const int shalf = lane_id % 2;          // 0 or 1
+    const int srow  = lane_id / 2;
+    const int shalf = lane_id % 2;
     const int grow  = row_start + srow;
     float running_max = -FLT_MAX;
     float running_sum = 0.0f;
 
-    /* -------- O accumulator in WMMA fragments -------- */
-    wmma::fragment<wmma::accumulator, WM, WMMA_N, WK, float> O_acc[4]; // D/16 chunks
+    wmma::fragment<wmma::accumulator, WM, WMMA_N, WK, float> O_acc[D_CHUNKS];
     for (int d = 0; d < D_CHUNKS; d++)
         wmma::fill_fragment(O_acc[d], 0.0f);
 
-    // Precompute mask base for this thread's row
     const int mask_base = (grow < N) ? ((b * H + h) * N + grow) * n_words : 0;
 
-    /* -------- tile over KV columns (BN=32, one mask word) -------- */
+    /* -------- tile loop with double buffering -------- */
     for (int tile = 0; tile < n_words; tile++) {
+        const int buf = tile & 1;
+        __half* K_s = K_buf + buf * BN * D;
+        __half* V_s = V_buf + buf * BN * D;
         const int col0 = tile * 32;
         const int tlen = min(32, N - col0);
 
-        // cooperative load K, V using cp.async (overlaps with compute)
-        {
-            const int n_vec = (BN * D) / 8;
-            const float4 zero4 = {0.0f, 0.0f, 0.0f, 0.0f};
-            float4* K_s4 = (float4*)K_s;
-            float4* V_s4 = (float4*)V_s;
-            const float4* K_src = (const float4*)(K + bhND + col0 * D);
-            const float4* V_src = (const float4*)(V + bhND + col0 * D);
-            for (int i = threadIdx.x; i < n_vec; i += blockDim.x) {
-                // Each float4 covers 8 consecutive half elements
-                // i maps to: row = (i*8) / D, col_within_D = (i*8) % D
-                int elem_start = i * 8;
-                int kn = elem_start / D;
-                int gc = col0 + kn;
-                K_s4[i] = (gc < N) ? K_src[i] : zero4;
-                V_s4[i] = (gc < N) ? V_src[i] : zero4;
-            }
+        // Async prefetch NEXT tile into other buffer
+        if (tile + 1 < n_words) {
+            int next_buf_off = (1 - buf) * BN * D;
+            prefetch_kv_tile(K_buf + next_buf_off, V_buf + next_buf_off,
+                             K, V, (tile + 1) * 32, N, D, bhND);
+            __pipeline_commit();
         }
-        __syncthreads();
 
-        /* -- WMMA: S[WM, BN] = Q × K^T  (two [16,16] halves) -- */
+        /* -- WMMA: S = Q × K^T -- */
         wmma::fragment<wmma::accumulator, WM, WMMA_N, WK, float> S_left, S_right;
         wmma::fill_fragment(S_left, 0.0f);
         wmma::fill_fragment(S_right, 0.0f);
@@ -188,36 +199,26 @@ __global__ void sparse_attn_wmma_fp16(
         for (int k = 0; k < D_CHUNKS; k++) {
             wmma::fragment<wmma::matrix_a, WM, WMMA_N, WK, __half, wmma::row_major> A;
             wmma::load_matrix_sync(A, &Q_s[warp_id * WM * D + k * WK], D);
-
             wmma::fragment<wmma::matrix_b, WM, WMMA_N, WK, __half, wmma::col_major> Bl, Br;
-            // K_left = K_s[0:16, :], K_right = K_s[16:32, :]
-            wmma::load_matrix_sync(Bl, &K_s[k * WK], D);               // rows 0-15
-            wmma::load_matrix_sync(Br, &K_s[16 * D + k * WK], D);      // rows 16-31
-
-            wmma::mma_sync(S_left,  A, Bl, S_left);
+            wmma::load_matrix_sync(Bl, &K_s[k * WK], D);
+            wmma::load_matrix_sync(Br, &K_s[16 * D + k * WK], D);
+            wmma::mma_sync(S_left, A, Bl, S_left);
             wmma::mma_sync(S_right, A, Br, S_right);
         }
+        #pragma unroll
+        for (int i = 0; i < 8; i++) { S_left.x[i] *= scale; S_right.x[i] *= scale; }
 
-        // scale
-        for (int i = 0; i < S_left.num_elements; i++) {
-            S_left.x[i] *= scale;
-            S_right.x[i] *= scale;
-        }
-
-        // store S → smem [WM, BN] row-major, stride BN=32
+        // Store S → smem
         float* my_S = &S_s[warp_id * WM * BN];
-        wmma::store_matrix_sync(&my_S[0],  S_left,  BN, wmma::mem_row_major);  // cols 0-15
-        wmma::store_matrix_sync(&my_S[16], S_right, BN, wmma::mem_row_major);  // cols 16-31
+        wmma::store_matrix_sync(&my_S[0], S_left, BN, wmma::mem_row_major);
+        wmma::store_matrix_sync(&my_S[16], S_right, BN, wmma::mem_row_major);
         __syncwarp();
 
-        /* -- mask + online softmax (2 threads per row, 16 cols each) -- */
+        /* -- softmax -- */
         float* S_row = &my_S[srow * BN];
         __half* P_row = &P_s[warp_id * WM * BN + srow * BN];
-
-        // BN=32 aligned to mask word boundary → clean read
         uint32_t mword = 0u;
-        if (grow < N)
-            mword = mask_packed[mask_base + tile];
+        if (grow < N) mword = mask_packed[mask_base + tile];
 
         int c_off = shalf * 16;
         float vals[16];
@@ -231,7 +232,6 @@ __global__ void sparse_attn_wmma_fp16(
         }
         float pmax = __shfl_xor_sync(0xffffffff, lmax, 1);
         float tile_max = fmaxf(lmax, pmax);
-
         float new_max = fmaxf(running_max, tile_max);
         float alpha = (running_max > -FLT_MAX) ? expf(running_max - new_max) : 0.0f;
 
@@ -243,19 +243,13 @@ __global__ void sparse_attn_wmma_fp16(
             P_row[c_off + i] = __float2half(p);
         }
         float psum = __shfl_xor_sync(0xffffffff, lsum, 1);
-        float tile_sum = lsum + psum;
-
-        running_sum = running_sum * alpha + tile_sum;
+        running_sum = running_sum * alpha + lsum + psum;
         running_max = new_max;
 
-        /* -- rescale O_acc fragments by alpha -- */
-        // Share alpha via smem (reuse S_s area for this warp)
-        float* alpha_buf = my_S;  // only need 16 floats, S_s has 512 per warp
+        /* -- rescale O_acc -- */
+        float* alpha_buf = my_S;
         if (shalf == 0) alpha_buf[srow] = alpha;
         __syncwarp();
-
-        // Fragment layout (m16n16k16 acc): thread group g=lane/4 handles rows 2g, 2g+1
-        // Use runtime-discovered mapping instead of hardcoded assumption
         #pragma unroll
         for (int d = 0; d < D_CHUNKS; d++) {
             #pragma unroll
@@ -264,34 +258,35 @@ __global__ void sparse_attn_wmma_fp16(
         }
         __syncwarp();
 
-        /* -- WMMA: O_acc += P × V  (accumulate directly) -- */
+        /* -- WMMA: O_acc += P × V -- */
         #pragma unroll
         for (int dc = 0; dc < D_CHUNKS; dc++) {
             wmma::fragment<wmma::matrix_a, WM, WMMA_N, WK, __half, wmma::row_major> Pl, Pr;
             wmma::fragment<wmma::matrix_b, WM, WMMA_N, WK, __half, wmma::row_major> Vt, Vb;
-
-            wmma::load_matrix_sync(Pl, &P_s[warp_id * WM * BN],      BN);
-            wmma::load_matrix_sync(Vt, &V_s[dc * WK],                 D);
+            wmma::load_matrix_sync(Pl, &P_s[warp_id * WM * BN], BN);
+            wmma::load_matrix_sync(Vt, &V_s[dc * WK], D);
             wmma::load_matrix_sync(Pr, &P_s[warp_id * WM * BN + 16], BN);
-            wmma::load_matrix_sync(Vb, &V_s[16 * D + dc * WK],        D);
-
+            wmma::load_matrix_sync(Vb, &V_s[16 * D + dc * WK], D);
             wmma::mma_sync(O_acc[dc], Pl, Vt, O_acc[dc]);
             wmma::mma_sync(O_acc[dc], Pr, Vb, O_acc[dc]);
         }
 
+        // Wait for next tile's async prefetch, then sync all threads
+        if (tile + 1 < n_words) {
+            __pipeline_wait_prior(0);
+        }
         __syncthreads();
     }
 
-    /* -------- write output (sequential per warp using S_s as temp) -------- */
+    /* -------- write output -------- */
     for (int w = 0; w < NWARPS; w++) {
         if (warp_id == w) {
-            float* O_buf = S_s;  // reuse S_s (2048 floats, need 1024)
+            float* O_buf = S_s;
             #pragma unroll
             for (int d = 0; d < D_CHUNKS; d++)
                 wmma::store_matrix_sync(&O_buf[d * WMMA_N], O_acc[d], D,
                                         wmma::mem_row_major);
             __syncwarp();
-
             if (grow < N) {
                 float inv = (running_sum > 0.0f) ? (1.0f / running_sum) : 0.0f;
                 int d_start = shalf * 32;
@@ -400,11 +395,19 @@ void sparse_attention_fwd_fp16(
     int N = params.seq_len;
     dim3 grid(CEIL_DIV(N, BM), params.batch_size * params.num_heads);
     dim3 block(NWARPS * 32);
-    int smem_bytes = BM * D * 2                 // Q_s
-                   + BN * D * 2                 // K_s
-                   + BN * D * 2                 // V_s
-                   + NWARPS * WM * BN * 4       // S_s
-                   + NWARPS * WM * BN * 2;      // P_s
+    // Double-buffered K/V: 2× K_s + 2× V_s
+    int smem_bytes = BM * D * 2             // Q_s
+                   + 2 * BN * D * 2         // K_buf[2]
+                   + 2 * BN * D * 2         // V_buf[2]
+                   + NWARPS * WM * BN * 4   // S_s
+                   + NWARPS * WM * BN * 2;  // P_s
+
+    // Request extended shared memory if needed (>48KB)
+    if (smem_bytes > 48 * 1024) {
+        cudaFuncSetAttribute(sparse_attn_wmma_fp16,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             smem_bytes);
+    }
 
     sparse_attn_wmma_fp16<<<grid, block, smem_bytes, stream>>>(
         (const __half*)params.q, (const __half*)params.k,
