@@ -141,6 +141,11 @@ __global__ void sparse_attn_wmma_fp16(
         #pragma unroll
         for (int i = 0; i < 8; i++) elem_rows[i] = __float2int_rn(mC.x[i]);
     }
+    // Identify unique rows for this thread (for alpha shuffle)
+    int my_r0 = elem_rows[0], my_r1 = my_r0;
+    for (int i = 1; i < 8; i++) {
+        if (elem_rows[i] != my_r0) { my_r1 = elem_rows[i]; break; }
+    }
     __syncthreads();
 
     /* -------- load Q -------- */
@@ -246,29 +251,32 @@ __global__ void sparse_attn_wmma_fp16(
         running_sum = running_sum * alpha + lsum + psum;
         running_max = new_max;
 
-        /* -- rescale O_acc -- */
-        float* alpha_buf = my_S;
-        if (shalf == 0) alpha_buf[srow] = alpha;
-        __syncwarp();
+        /* -- rescale O_acc via shuffle (no smem needed) -- */
+        // srow = lane_id/2 owns alpha for its row. Get alpha for fragment rows via shfl.
+        float alpha_r0 = __shfl_sync(0xffffffff, alpha, 2 * my_r0);
+        float alpha_r1 = __shfl_sync(0xffffffff, alpha, 2 * my_r1);
         #pragma unroll
         for (int d = 0; d < D_CHUNKS; d++) {
             #pragma unroll
             for (int i = 0; i < 8; i++)
-                O_acc[d].x[i] *= alpha_buf[elem_rows[i]];
+                O_acc[d].x[i] *= (elem_rows[i] == my_r0) ? alpha_r0 : alpha_r1;
         }
-        __syncwarp();
 
         /* -- WMMA: O_acc += P × V -- */
-        #pragma unroll
-        for (int dc = 0; dc < D_CHUNKS; dc++) {
+        // Load P fragments once, reuse across all D chunks
+        {
             wmma::fragment<wmma::matrix_a, WM, WMMA_N, WK, __half, wmma::row_major> Pl, Pr;
-            wmma::fragment<wmma::matrix_b, WM, WMMA_N, WK, __half, wmma::row_major> Vt, Vb;
             wmma::load_matrix_sync(Pl, &P_s[warp_id * WM * BN], BN);
-            wmma::load_matrix_sync(Vt, &V_s[dc * WK], D);
             wmma::load_matrix_sync(Pr, &P_s[warp_id * WM * BN + 16], BN);
-            wmma::load_matrix_sync(Vb, &V_s[16 * D + dc * WK], D);
-            wmma::mma_sync(O_acc[dc], Pl, Vt, O_acc[dc]);
-            wmma::mma_sync(O_acc[dc], Pr, Vb, O_acc[dc]);
+
+            #pragma unroll
+            for (int dc = 0; dc < D_CHUNKS; dc++) {
+                wmma::fragment<wmma::matrix_b, WM, WMMA_N, WK, __half, wmma::row_major> Vt, Vb;
+                wmma::load_matrix_sync(Vt, &V_s[dc * WK], D);
+                wmma::load_matrix_sync(Vb, &V_s[16 * D + dc * WK], D);
+                wmma::mma_sync(O_acc[dc], Pl, Vt, O_acc[dc]);
+                wmma::mma_sync(O_acc[dc], Pr, Vb, O_acc[dc]);
+            }
         }
 
         // Wait for next tile's async prefetch, then sync all threads
