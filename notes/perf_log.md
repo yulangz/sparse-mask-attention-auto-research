@@ -58,6 +58,19 @@ mapping (R8), larger BLOCK_M for K/V sharing (R9), vectorized float4 loads (R16)
 **Final best**: 44.6 ms (18.48 TFLOPS, 16.1% MFU) — R20
 From 444.4ms to 44.6ms = **9.96x speedup** over 23 optimization rounds.
 
+## Round 24: Smem Padding for S_s/P_s (Bank Conflict Reduction)
+- **Change**: Added stride padding to S_s (float, stride 32→36) and P_s (half, stride 32→48)
+  to break 128-byte bank alignment. S_STRIDE*4=144B (144%128=16, offset by 4 banks),
+  P_STRIDE*2=96B. Eliminates worst-case 16-way bank conflicts in softmax smem accesses.
+- **Latency**: 41.506 ms (was 44.6 ms)
+- **TFLOPS**: 19.87 (was 18.48)
+- **Speedup**: 1.08x over R20, **10.71x** vs baseline
+- **Status**: ACCEPTED
+
+Analysis: Clean 8% gain from reducing bank conflicts in the S→softmax→P shared memory
+round-trip, which is the hottest path (executed 512× per block). Smem increased from 57KB
+to 63KB but still fits 3 blocks/SM (registers remain the limiter at 67/thread).
+
 **Key breakthroughs** (in order of impact):
 1. **R8**: Fragment O accumulation w/ runtime row mapping (140→53ms, 2.6x single-round gain)
 2. **R6**: WMMA BN=32 (231→140ms, 1.65x) 

@@ -65,6 +65,8 @@ void pack_mask_bits(
 #define NWARPS 8
 #define BM (WM * NWARPS)
 #define D_CHUNKS 4
+#define S_STRIDE (BN + 4)   // padded stride for float S_s to avoid bank conflicts (36 floats=144B, 144%128=16)
+#define P_STRIDE (BN + 16)  // padded stride for half P_s, must be multiple of 16 for WMMA (48 halfs=96B)
 
 // Helper: issue cp.async for one K/V tile into smem buffer
 __device__ __forceinline__ void prefetch_kv_tile(
@@ -116,8 +118,8 @@ __global__ void sparse_attn_wmma_fp16(
     __half* Q_s   = (__half*)smem;                                  // [BM, D]
     __half* K_buf = Q_s + BM * D;                                  // [2, BN, D]
     __half* V_buf = K_buf + 2 * BN * D;                            // [2, BN, D]
-    float*  S_s   = (float*)(V_buf + 2 * BN * D);                  // [NWARPS, WM, BN]
-    __half* P_s   = (__half*)(S_s + NWARPS * WM * BN);             // [NWARPS, WM, BN]
+    float*  S_s   = (float*)(V_buf + 2 * BN * D);                  // [NWARPS, WM, S_STRIDE] padded
+    __half* P_s   = (__half*)(S_s + NWARPS * WM * S_STRIDE);       // [NWARPS, WM, P_STRIDE] padded
 
     /* -------- fragment row mapping -------- */
     __half* tmpA = Q_s;
@@ -213,28 +215,40 @@ __global__ void sparse_attn_wmma_fp16(
         #pragma unroll
         for (int i = 0; i < 8; i++) { S_left.x[i] *= scale; S_right.x[i] *= scale; }
 
-        // Store S → smem
-        float* my_S = &S_s[warp_id * WM * BN];
-        wmma::store_matrix_sync(&my_S[0], S_left, BN, wmma::mem_row_major);
-        wmma::store_matrix_sync(&my_S[16], S_right, BN, wmma::mem_row_major);
+        // Store S → smem (padded stride)
+        float* my_S = &S_s[warp_id * WM * S_STRIDE];
+        wmma::store_matrix_sync(&my_S[0], S_left, S_STRIDE, wmma::mem_row_major);
+        wmma::store_matrix_sync(&my_S[16], S_right, S_STRIDE, wmma::mem_row_major);
         __syncwarp();
 
-        /* -- softmax -- */
-        float* S_row = &my_S[srow * BN];
-        __half* P_row = &P_s[warp_id * WM * BN + srow * BN];
+        /* -- softmax (process in 2 sub-passes of 8 to reduce stack) -- */
+        float* S_row = &my_S[srow * S_STRIDE];
+        __half* P_row = &P_s[warp_id * WM * P_STRIDE + srow * P_STRIDE];
         uint32_t mword = 0u;
         if (grow < N) mword = mask_packed[mask_base + tile];
 
         int c_off = shalf * 16;
-        float vals[16];
         float lmax = -FLT_MAX;
+
+        // Sub-pass 1: cols [c_off, c_off+8) — find max, store vals, compute P
+        float vals_a[8];
         #pragma unroll
-        for (int i = 0; i < 16; i++) {
+        for (int i = 0; i < 8; i++) {
             int j = c_off + i;
             bool ok = (grow < N) && (j < tlen) && ((mword >> j) & 1u);
-            vals[i] = ok ? S_row[j] : -FLT_MAX;
-            lmax = fmaxf(lmax, vals[i]);
+            vals_a[i] = ok ? S_row[j] : -FLT_MAX;
+            lmax = fmaxf(lmax, vals_a[i]);
         }
+        // Sub-pass 2: cols [c_off+8, c_off+16) — find max
+        float vals_b[8];
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int j = c_off + 8 + i;
+            bool ok = (grow < N) && (j < tlen) && ((mword >> j) & 1u);
+            vals_b[i] = ok ? S_row[j] : -FLT_MAX;
+            lmax = fmaxf(lmax, vals_b[i]);
+        }
+
         float pmax = __shfl_xor_sync(0xffffffff, lmax, 1);
         float tile_max = fmaxf(lmax, pmax);
         float new_max = fmaxf(running_max, tile_max);
@@ -242,10 +256,16 @@ __global__ void sparse_attn_wmma_fp16(
 
         float lsum = 0.0f;
         #pragma unroll
-        for (int i = 0; i < 16; i++) {
-            float p = (vals[i] > -FLT_MAX) ? expf(vals[i] - new_max) : 0.0f;
+        for (int i = 0; i < 8; i++) {
+            float p = (vals_a[i] > -FLT_MAX) ? expf(vals_a[i] - new_max) : 0.0f;
             lsum += p;
             P_row[c_off + i] = __float2half(p);
+        }
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            float p = (vals_b[i] > -FLT_MAX) ? expf(vals_b[i] - new_max) : 0.0f;
+            lsum += p;
+            P_row[c_off + 8 + i] = __float2half(p);
         }
         float psum = __shfl_xor_sync(0xffffffff, lsum, 1);
         running_sum = running_sum * alpha + lsum + psum;
@@ -266,8 +286,8 @@ __global__ void sparse_attn_wmma_fp16(
         // Load P fragments once, reuse across all D chunks
         {
             wmma::fragment<wmma::matrix_a, WM, WMMA_N, WK, __half, wmma::row_major> Pl, Pr;
-            wmma::load_matrix_sync(Pl, &P_s[warp_id * WM * BN], BN);
-            wmma::load_matrix_sync(Pr, &P_s[warp_id * WM * BN + 16], BN);
+            wmma::load_matrix_sync(Pl, &P_s[warp_id * WM * P_STRIDE], P_STRIDE);
+            wmma::load_matrix_sync(Pr, &P_s[warp_id * WM * P_STRIDE + 16], P_STRIDE);
 
             #pragma unroll
             for (int dc = 0; dc < D_CHUNKS; dc++) {
@@ -403,12 +423,12 @@ void sparse_attention_fwd_fp16(
     int N = params.seq_len;
     dim3 grid(CEIL_DIV(N, BM), params.batch_size * params.num_heads);
     dim3 block(NWARPS * 32);
-    // Double-buffered K/V: 2× K_s + 2× V_s
+    // Double-buffered K/V: 2× K_s + 2× V_s, padded S_s and P_s
     int smem_bytes = BM * D * 2             // Q_s
                    + 2 * BN * D * 2         // K_buf[2]
                    + 2 * BN * D * 2         // V_buf[2]
-                   + NWARPS * WM * BN * 4   // S_s
-                   + NWARPS * WM * BN * 2;  // P_s
+                   + NWARPS * WM * S_STRIDE * 4   // S_s (padded)
+                   + NWARPS * WM * P_STRIDE * 2;  // P_s (padded)
 
     // Request extended shared memory if needed (>48KB)
     if (smem_bytes > 48 * 1024) {
