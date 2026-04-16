@@ -110,6 +110,26 @@ Analysis: 5% gain from reducing synchronization and prefetch overhead (256 syncs
 **Key discovery**: pack_mask takes **13.5ms** — 37% of total time! All prior measurements
 included this overhead. Kernel-only: 23.3ms vs Triton 20.4ms = only 1.14× gap.
 
+## Round 28: Vectorized pack_mask (__ballot_sync)
+- **Change**: Replaced scalar per-bit pack_mask with warp-level __ballot_sync. One warp
+  packs 32 bools → 1 uint32 in a single intrinsic. Coalesced 32-byte reads.
+- **pack_mask latency**: 1.983 ms (was 13.452 ms) — **6.8× speedup**
+- **Total latency**: 25.290 ms (was 36.755 ms)
+- **TFLOPS**: 32.61 total (was 22.44)
+- **Speedup**: 1.45x over R27 total, **17.6x** vs baseline
+- **Status**: ACCEPTED
+
+**Updated comparison at B=1, N=16384, H=12, D=64 (FP16):**
+```
+flash-attn:      2.65ms  (311 TFLOPS)  dense, no mask
+cuDNN SDPA:     11.02ms  ( 75 TFLOPS)  dense
+Triton:         20.40ms  ( 40 TFLOPS)  sparse     ← 1.24× faster
+Ours (R28):     25.29ms  ( 33 TFLOPS)  sparse     ← HERE
+PyTorch Ref:    32.26ms  ( 26 TFLOPS)  sparse     ← 1.28× slower
+FlashInfer:     71.20ms  ( 12 TFLOPS)  sparse     ← 2.82× slower
+Baseline:      444.39ms  (  2 TFLOPS)  scalar     ← 17.6× slower
+```
+
 **Key breakthroughs** (in order of impact):
 1. **R8**: Fragment O accumulation w/ runtime row mapping (140→53ms, 2.6x single-round gain)
 2. **R6**: WMMA BN=32 (231→140ms, 1.65x) 

@@ -24,24 +24,27 @@ using namespace nvcuda;
 // Pack Mask Kernel
 // ============================================================
 
+// Vectorized pack_mask using __ballot_sync: one warp packs 32 bools → 1 uint32
 __global__ void pack_mask_kernel(
     const bool* __restrict__ mask,
     uint32_t* __restrict__ mask_packed,
     int total_rows, int N
 ) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    const int lane_id = threadIdx.x & 31;
+    const int warp_id = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * warps_per_block + warp_id;
     if (row >= total_rows) return;
-    int n_words = (N + 31) / 32;
+
+    const int n_words = (N + 31) / 32;
+    const int base = row * N;
+    const int out_base = row * n_words;
+
     for (int w = 0; w < n_words; w++) {
-        uint32_t packed = 0u;
-        int cs = w * 32;
-        #pragma unroll
-        for (int bit = 0; bit < 32; bit++) {
-            int col = cs + bit;
-            if (col < N && mask[row * N + col])
-                packed |= (1u << bit);
-        }
-        mask_packed[row * n_words + w] = packed;
+        int col = w * 32 + lane_id;
+        bool b = (col < N) && mask[base + col];
+        uint32_t packed = __ballot_sync(0xffffffff, b);
+        if (lane_id == 0) mask_packed[out_base + w] = packed;
     }
 }
 
@@ -50,7 +53,10 @@ void pack_mask_bits(
     int B, int H, int N, cudaStream_t stream
 ) {
     int total = B * H * N;
-    pack_mask_kernel<<<CEIL_DIV(total, 256), 256, 0, stream>>>(
+    int warps_per_block = 8;  // 256 threads
+    int threads = warps_per_block * 32;
+    int blocks = CEIL_DIV(total, warps_per_block);
+    pack_mask_kernel<<<blocks, threads, 0, stream>>>(
         mask, mask_packed, total, N);
 }
 
