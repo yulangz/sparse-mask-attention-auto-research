@@ -99,6 +99,17 @@ Register pressure increased (elem_cols[8] + 2 running states) but stays within l
 Analysis: 5% gain from reducing synchronization and prefetch overhead (256 syncs instead of
 512). Smem increased from 42KB to 58KB (larger K/V buffers) but still 3 blocks/SM.
 
+## Round 27: BN_TILE=128 (4×32 Sub-Tiles per Prefetch)
+- **Change**: Further doubled outer tile to 128 columns (4 sub-tiles of 32). K/V buffers
+  now 32KB each. Smem 92KB → 2 blocks/SM (was 3). Reduces syncs from 256 to 128.
+- **Latency**: 36.755 ms total (23.304 ms kernel-only)
+- **TFLOPS**: 22.44 total / 35.39 kernel-only
+- **Speedup**: 1.03x over R26
+- **Status**: ACCEPTED
+
+**Key discovery**: pack_mask takes **13.5ms** — 37% of total time! All prior measurements
+included this overhead. Kernel-only: 23.3ms vs Triton 20.4ms = only 1.14× gap.
+
 **Key breakthroughs** (in order of impact):
 1. **R8**: Fragment O accumulation w/ runtime row mapping (140→53ms, 2.6x single-round gain)
 2. **R6**: WMMA BN=32 (231→140ms, 1.65x) 

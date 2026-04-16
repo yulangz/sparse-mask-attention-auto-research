@@ -65,7 +65,7 @@ void pack_mask_bits(
 #define NWARPS 8
 #define BM (WM * NWARPS)
 #define D_CHUNKS 4
-#define BN_TILE 64          // outer tile width for K/V prefetch (2x BN sub-tiles)
+#define BN_TILE 128         // outer tile width for K/V prefetch (4x BN sub-tiles)
 #define P_STRIDE (BN + 16)  // padded stride for half P_s, must be multiple of 16 for WMMA (48 halfs=96B)
 
 // Helper: issue cp.async for one K/V tile (BN_TILE=64 cols) into smem buffer
@@ -198,12 +198,12 @@ __global__ void sparse_attn_wmma_fp16(
             __pipeline_commit();
         }
 
-        // Process 2 sub-tiles of 32 cols each
-        for (int sub = 0; sub < 2; sub++) {
+        // Process BN_TILE/BN sub-tiles of 32 cols each
+        for (int sub = 0; sub < BN_TILE / BN; sub++) {
             const int sub_col0 = tile64 * BN_TILE + sub * BN;
             if (sub_col0 >= N) break;
             const int tlen = min(BN, N - sub_col0);
-            const int mask_word = tile64 * 2 + sub;
+            const int mask_word = tile64 * (BN_TILE / BN) + sub;
 
             __half* K_s = K_buf + buf * BN_TILE * D + sub * BN * D;
             __half* V_s = V_buf + buf * BN_TILE * D + sub * BN * D;
