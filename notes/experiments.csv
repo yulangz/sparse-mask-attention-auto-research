@@ -14,3 +14,4 @@ round,optimization,latency_ms,tflops,mfu_pct,accepted,notes
 12,BN=64 + NWARPS=4 (halve tiles again),60.433,13.63,11.9,no,regression: occupancy loss from 80KB smem; reverted
 13,two-pass softmax (eliminate vals[] stack),58.818,14.02,12.2,no,regression: extra smem reads > register savings; reverted
 14,NWARPS=6 (occupancy sweet spot test),52.616,15.68,13.6,no,regression: less K/V sharing > occupancy gain; reverted
+15,in-register softmax (eliminate S_s),61.442,13.42,11.6,no,regression: scattered P_s writes + branch divergence; reverted
