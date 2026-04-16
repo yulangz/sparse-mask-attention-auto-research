@@ -151,16 +151,17 @@ __global__ void sparse_attn_wmma_fp16(
     for (int d = 0; d < D_CHUNKS; d++)
         wmma::fill_fragment(O_acc[d], 0.0f);
 
+    // Precompute mask base for this thread's row
+    const int mask_base = (grow < N) ? ((b * H + h) * N + grow) * n_words : 0;
+
     /* -------- tile over KV columns (BN=32, one mask word) -------- */
     for (int tile = 0; tile < n_words; tile++) {
         const int col0 = tile * 32;
         const int tlen = min(32, N - col0);
 
-        // cooperative load K, V  [BN, D] using vectorized float4 loads
-        // BN * D = 32 * 64 = 2048 half elements = 256 float4 per buffer
-        // With 256 threads: 1 float4 per thread per buffer
+        // cooperative load K, V using cp.async (overlaps with compute)
         {
-            const int n_vec = (BN * D) / 8;  // number of float4 (8 halfs each)
+            const int n_vec = (BN * D) / 8;
             const float4 zero4 = {0.0f, 0.0f, 0.0f, 0.0f};
             float4* K_s4 = (float4*)K_s;
             float4* V_s4 = (float4*)V_s;
@@ -215,8 +216,8 @@ __global__ void sparse_attn_wmma_fp16(
 
         // BN=32 aligned to mask word boundary → clean read
         uint32_t mword = 0u;
-        if (grow < N && tile < n_words)
-            mword = mask_packed[((b * H + h) * N + grow) * n_words + tile];
+        if (grow < N)
+            mword = mask_packed[mask_base + tile];
 
         int c_off = shalf * 16;
         float vals[16];
