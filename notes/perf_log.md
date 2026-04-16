@@ -50,9 +50,29 @@ online softmax is heavy on instruction overhead relative to the small D=64 compu
 **Key breakthroughs**: WMMA tensor cores (R5-R6), fragment O accumulation with runtime
 mapping (R8), larger BLOCK_M for K/V sharing (R9), vectorized float4 loads (R16).
 
-| 14-17 | Various (NWARPS, in-reg softmax, etc.) | - | - | ALL REJECT |
 | 16 | Vectorized K/V float4 loads | **47.4** | **9.38x** | **ACCEPT** |
+| 18 | cp.async double-buffered K/V | **44.9** | **9.90x** | **ACCEPT** |
+| 20 | Alpha via shuffle (no smem) | **44.6** | **9.96x** | **ACCEPT** |
+| 14-15,17,19,21-23 | Various attempts | - | - | ALL REJECT |
 
-Remaining gap vs Triton (20.4ms): ~2.3x. Bottleneck: per-tile softmax overhead, 67 regs
-limiting to 3 blocks/SM (37.5% occupancy), and smem round-trips for S and P.
+**Final best**: 44.6 ms (18.48 TFLOPS, 16.1% MFU) — R20
+From 444.4ms to 44.6ms = **9.96x speedup** over 23 optimization rounds.
+
+**Key breakthroughs** (in order of impact):
+1. **R8**: Fragment O accumulation w/ runtime row mapping (140→53ms, 2.6x single-round gain)
+2. **R6**: WMMA BN=32 (231→140ms, 1.65x) 
+3. **R2**: BLOCK_M=16 for K/V sharing (312→237ms, 1.32x)
+4. **R18**: cp.async double-buffered K/V prefetch (47→45ms)
+5. **R20**: Alpha via shuffle (no smem round-trip)
+
+**Comparison at B=1, N=16384, H=12, D=64 (FP16):**
+```
+flash-attn:     2.65ms  (311 TFLOPS)  dense, no mask
+cuDNN SDPA:    11.02ms  ( 75 TFLOPS)  dense
+Triton:        20.40ms  ( 40 TFLOPS)  sparse     ← 2.2x faster
+PyTorch Ref:   32.26ms  ( 26 TFLOPS)  sparse     ← 1.4x faster
+Ours (R20):    44.63ms  ( 18 TFLOPS)  sparse     ← HERE
+FlashInfer:    71.20ms  ( 12 TFLOPS)  sparse     ← 1.6x slower
+Baseline:     444.39ms  (  2 TFLOPS)  scalar     ← 10x slower
+```
 
