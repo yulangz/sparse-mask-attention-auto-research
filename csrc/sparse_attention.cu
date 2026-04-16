@@ -150,11 +150,25 @@ __global__ void sparse_attn_wmma_fp16(
         const int col0 = tile * 32;
         const int tlen = min(32, N - col0);
 
-        // cooperative load K, V  [BN, D]
-        for (int i = threadIdx.x; i < BN * D; i += blockDim.x) {
-            int kn = i / D, kd = i % D, gc = col0 + kn;
-            K_s[i] = (gc < N) ? K[bhND + gc * D + kd] : __float2half(0.0f);
-            V_s[i] = (gc < N) ? V[bhND + gc * D + kd] : __float2half(0.0f);
+        // cooperative load K, V  [BN, D] using vectorized float4 loads
+        // BN * D = 32 * 64 = 2048 half elements = 256 float4 per buffer
+        // With 256 threads: 1 float4 per thread per buffer
+        {
+            const int n_vec = (BN * D) / 8;  // number of float4 (8 halfs each)
+            const float4 zero4 = {0.0f, 0.0f, 0.0f, 0.0f};
+            float4* K_s4 = (float4*)K_s;
+            float4* V_s4 = (float4*)V_s;
+            const float4* K_src = (const float4*)(K + bhND + col0 * D);
+            const float4* V_src = (const float4*)(V + bhND + col0 * D);
+            for (int i = threadIdx.x; i < n_vec; i += blockDim.x) {
+                // Each float4 covers 8 consecutive half elements
+                // i maps to: row = (i*8) / D, col_within_D = (i*8) % D
+                int elem_start = i * 8;
+                int kn = elem_start / D;
+                int gc = col0 + kn;
+                K_s4[i] = (gc < N) ? K_src[i] : zero4;
+                V_s4[i] = (gc < N) ? V_src[i] : zero4;
+            }
         }
         __syncthreads();
 
