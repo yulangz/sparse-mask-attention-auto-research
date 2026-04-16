@@ -46,10 +46,13 @@ online softmax is heavy on instruction overhead relative to the small D=64 compu
 | 12 | BN=64 | 60.4 | - | REJECT |
 | 13 | Two-pass softmax | 58.8 | - | REJECT |
 
-**Current best**: 49.9 ms (16.54 TFLOPS, 14.4% MFU)
+**Current best**: 47.4 ms (17.40 TFLOPS, 15.1% MFU) — R16 vectorized loads
 **Key breakthroughs**: WMMA tensor cores (R5-R6), fragment O accumulation with runtime
-mapping (R8), larger BLOCK_M for K/V sharing (R9).
+mapping (R8), larger BLOCK_M for K/V sharing (R9), vectorized float4 loads (R16).
 
-Remaining gap vs Triton (20.4ms): ~2.4x. Main bottleneck is per-tile softmax overhead
-(smem round-trips for S and P, expf calls, shuffle reductions).
+| 14-17 | Various (NWARPS, in-reg softmax, etc.) | - | - | ALL REJECT |
+| 16 | Vectorized K/V float4 loads | **47.4** | **9.38x** | **ACCEPT** |
+
+Remaining gap vs Triton (20.4ms): ~2.3x. Bottleneck: per-tile softmax overhead, 67 regs
+limiting to 3 blocks/SM (37.5% occupancy), and smem round-trips for S and P.
 
