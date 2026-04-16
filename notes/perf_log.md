@@ -119,15 +119,29 @@ included this overhead. Kernel-only: 23.3ms vs Triton 20.4ms = only 1.14× gap.
 - **Speedup**: 1.45x over R27 total, **17.6x** vs baseline
 - **Status**: ACCEPTED
 
+## Round 29: __launch_bounds__ + Remove Sub-Tile Unroll
+- **Change**: Added `__launch_bounds__(256, 2)` to force 2 blocks/SM. Removed `#pragma
+  unroll` from the sub-tile loop (was causing register explosion: 193→133 regs).
+  With launch_bounds, compiler targets 128 regs (20B spill, negligible).
+- **Kernel latency**: 20.355 ms (was 23.3 ms) — **12.6% improvement**
+- **Total latency**: 22.339 ms (was 25.3 ms)
+- **TFLOPS**: 40.51 kernel / 36.91 total
+- **Speedup**: **19.88×** vs baseline, kernel matches Triton (20.4ms)!
+- **Status**: ACCEPTED
+
+**Key insight**: Register pressure was the hidden bottleneck. With 193 regs, only 1 block/SM
+(8 warps). At 128 regs, 2 blocks/SM (16 warps) — 2× occupancy = 12% faster.
+
 **Updated comparison at B=1, N=16384, H=12, D=64 (FP16):**
 ```
 flash-attn:      2.65ms  (311 TFLOPS)  dense, no mask
 cuDNN SDPA:     11.02ms  ( 75 TFLOPS)  dense
-Triton:         20.40ms  ( 40 TFLOPS)  sparse     ← 1.24× faster
-Ours (R28):     25.29ms  ( 33 TFLOPS)  sparse     ← HERE
-PyTorch Ref:    32.26ms  ( 26 TFLOPS)  sparse     ← 1.28× slower
-FlashInfer:     71.20ms  ( 12 TFLOPS)  sparse     ← 2.82× slower
-Baseline:      444.39ms  (  2 TFLOPS)  scalar     ← 17.6× slower
+Triton:         20.40ms  ( 40 TFLOPS)  sparse     ← 1.00× (kernel parity!)
+Ours (R29):     22.34ms  ( 37 TFLOPS)  sparse     ← HERE (total w/ pack_mask)
+  kernel-only:  20.36ms  ( 41 TFLOPS)                  (matches Triton!)
+PyTorch Ref:    32.26ms  ( 26 TFLOPS)  sparse     ← 1.44× slower
+FlashInfer:     71.20ms  ( 12 TFLOPS)  sparse     ← 3.19× slower
+Baseline:      444.39ms  (  2 TFLOPS)  scalar     ← 19.9× slower
 ```
 
 **Key breakthroughs** (in order of impact):

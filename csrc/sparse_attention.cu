@@ -98,7 +98,7 @@ __device__ __forceinline__ void prefetch_kv_tile(
     }
 }
 
-__global__ void sparse_attn_wmma_fp16(
+__global__ __launch_bounds__(NWARPS * 32, 2) void sparse_attn_wmma_fp16(
     const __half* __restrict__ Q,
     const __half* __restrict__ K,
     const __half* __restrict__ V,
@@ -204,7 +204,7 @@ __global__ void sparse_attn_wmma_fp16(
             __pipeline_commit();
         }
 
-        // Process BN_TILE/BN sub-tiles of 32 cols each
+        // Process BN_TILE/BN sub-tiles of 32 cols each (do NOT unroll — saves registers)
         for (int sub = 0; sub < BN_TILE / BN; sub++) {
             const int sub_col0 = tile64 * BN_TILE + sub * BN;
             if (sub_col0 >= N) break;

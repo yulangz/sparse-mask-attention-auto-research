@@ -29,3 +29,4 @@ round,optimization,latency_ms,tflops,mfu_pct,accepted,notes
 26,BN_TILE=64 (2x32 sub-tiles per prefetch),37.710,21.87,19.0,yes,1.05x over R25; 11.78x vs baseline; halved syncs + prefetches
 27,BN_TILE=128 (4x32 sub-tiles per prefetch),36.755,22.44,19.5,yes,1.03x over R26; kernel-only 23.3ms (35.4 TFLOPS); pack_mask adds 13.5ms
 28,vectorized pack_mask (__ballot_sync),25.290,32.61,28.4,yes,1.45x over R27; pack_mask 13.5ms->2.0ms; total now 25.3ms vs Triton 20.4ms
+29,launch_bounds(256 2) + no sub-tile unroll,22.339,36.91,32.1,yes,kernel 20.4ms! 128 regs 2 blocks/SM; total 22.3ms; 19.88x vs baseline
