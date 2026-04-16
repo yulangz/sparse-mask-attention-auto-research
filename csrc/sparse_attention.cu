@@ -125,11 +125,17 @@ __global__ void sparse_attn_wmma_fp16(
         elem_rows[i] = __float2int_rn(map_frag.x[i]);
     __syncthreads();
 
-    /* -------- load Q -------- */
-    for (int i = threadIdx.x; i < BM * D; i += blockDim.x) {
-        int r = i / D, d = i % D;
-        int gr = blockIdx.x * BM + r;
-        Q_s[i] = (gr < N) ? Q[bhND + gr * D + d] : __float2half(0.0f);
+    /* -------- load Q (vectorized float4) -------- */
+    {
+        const int n_vec = (BM * D) / 8;
+        const float4 zero4 = {0.0f, 0.0f, 0.0f, 0.0f};
+        float4* Q_s4 = (float4*)Q_s;
+        const float4* Q_src = (const float4*)(Q + bhND + blockIdx.x * BM * D);
+        for (int i = threadIdx.x; i < n_vec; i += blockDim.x) {
+            int kn = (i * 8) / D;
+            int gr = blockIdx.x * BM + kn;
+            Q_s4[i] = (gr < N) ? Q_src[i] : zero4;
+        }
     }
     __syncthreads();
 
