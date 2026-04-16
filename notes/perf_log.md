@@ -86,6 +86,19 @@ Analysis: 5% gain from eliminating S_s store/load (17KB per tile × 512 tiles) a
 the serial 8-warp output with parallel direct writes. Smem dropped from 63KB to 42KB.
 Register pressure increased (elem_cols[8] + 2 running states) but stays within limits.
 
+## Round 26: BN_TILE=64 (2×32 Sub-Tiles per Prefetch)
+- **Change**: Doubled the outer tile width to 64 columns for K/V prefetch while keeping
+  BN=32 for sub-tile WMMA processing. Each 64-col tile processes 2 sub-tiles of 32 cols.
+  K/V buffers doubled (8KB→16KB each). Halves the number of __syncthreads, cp.async
+  prefetches, and pipeline commits.
+- **Latency**: 37.710 ms (was 39.6 ms)
+- **TFLOPS**: 21.87 (was 20.84)
+- **Speedup**: 1.05x over R25, **11.78x** vs baseline
+- **Status**: ACCEPTED
+
+Analysis: 5% gain from reducing synchronization and prefetch overhead (256 syncs instead of
+512). Smem increased from 42KB to 58KB (larger K/V buffers) but still 3 blocks/SM.
+
 **Key breakthroughs** (in order of impact):
 1. **R8**: Fragment O accumulation w/ runtime row mapping (140→53ms, 2.6x single-round gain)
 2. **R6**: WMMA BN=32 (231→140ms, 1.65x) 

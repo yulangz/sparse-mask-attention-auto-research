@@ -65,16 +65,16 @@ void pack_mask_bits(
 #define NWARPS 8
 #define BM (WM * NWARPS)
 #define D_CHUNKS 4
-#define S_STRIDE (BN + 4)   // padded stride for float S_s to avoid bank conflicts (36 floats=144B, 144%128=16)
+#define BN_TILE 64          // outer tile width for K/V prefetch (2x BN sub-tiles)
 #define P_STRIDE (BN + 16)  // padded stride for half P_s, must be multiple of 16 for WMMA (48 halfs=96B)
 
-// Helper: issue cp.async for one K/V tile into smem buffer
+// Helper: issue cp.async for one K/V tile (BN_TILE=64 cols) into smem buffer
 __device__ __forceinline__ void prefetch_kv_tile(
     __half* K_dst, __half* V_dst,
     const __half* K_src_base, const __half* V_src_base,
     int col0, int N, int D, int bhND
 ) {
-    const int n_vec = (BN * D) / 8;
+    const int n_vec = (BN_TILE * D) / 8;
     float4* K4 = (float4*)K_dst;
     float4* V4 = (float4*)V_dst;
     const float4* Ks = (const float4*)(K_src_base + bhND + col0 * D);
@@ -116,9 +116,9 @@ __global__ void sparse_attn_wmma_fp16(
     /* -------- shared memory: no S_s needed -------- */
     extern __shared__ char smem[];
     __half* Q_s   = (__half*)smem;                                  // [BM, D]
-    __half* K_buf = Q_s + BM * D;                                  // [2, BN, D]
-    __half* V_buf = K_buf + 2 * BN * D;                            // [2, BN, D]
-    __half* P_s   = (__half*)(V_buf + 2 * BN * D);                 // [NWARPS, WM, P_STRIDE] padded
+    __half* K_buf = Q_s + BM * D;                                  // [2, BN_TILE, D]
+    __half* V_buf = K_buf + 2 * BN_TILE * D;                       // [2, BN_TILE, D]
+    __half* P_s   = (__half*)(V_buf + 2 * BN_TILE * D);            // [NWARPS, WM, P_STRIDE] padded
 
     /* -------- fragment row AND column mapping -------- */
     __half* tmpA = Q_s;
@@ -185,21 +185,28 @@ __global__ void sparse_attn_wmma_fp16(
     const int mask_base_r0 = (grow_r0 < N) ? ((b * H + h) * N + grow_r0) * n_words : 0;
     const int mask_base_r1 = (grow_r1 < N) ? ((b * H + h) * N + grow_r1) * n_words : 0;
 
-    /* -------- tile loop with double buffering -------- */
-    for (int tile = 0; tile < n_words; tile++) {
-        const int buf = tile & 1;
-        __half* K_s = K_buf + buf * BN * D;
-        __half* V_s = V_buf + buf * BN * D;
-        const int col0 = tile * 32;
-        const int tlen = min(32, N - col0);
+    /* -------- tile loop: 64-col outer tiles, 2x 32-col sub-tiles -------- */
+    const int n_tiles_64 = (N + BN_TILE - 1) / BN_TILE;
+    for (int tile64 = 0; tile64 < n_tiles_64; tile64++) {
+        const int buf = tile64 & 1;
 
-        // Async prefetch NEXT tile into other buffer
-        if (tile + 1 < n_words) {
-            int next_buf_off = (1 - buf) * BN * D;
+        // Async prefetch NEXT 64-col tile into other buffer
+        if (tile64 + 1 < n_tiles_64) {
+            int next_buf_off = (1 - buf) * BN_TILE * D;
             prefetch_kv_tile(K_buf + next_buf_off, V_buf + next_buf_off,
-                             K, V, (tile + 1) * 32, N, D, bhND);
+                             K, V, (tile64 + 1) * BN_TILE, N, D, bhND);
             __pipeline_commit();
         }
+
+        // Process 2 sub-tiles of 32 cols each
+        for (int sub = 0; sub < 2; sub++) {
+            const int sub_col0 = tile64 * BN_TILE + sub * BN;
+            if (sub_col0 >= N) break;
+            const int tlen = min(BN, N - sub_col0);
+            const int mask_word = tile64 * 2 + sub;
+
+            __half* K_s = K_buf + buf * BN_TILE * D + sub * BN * D;
+            __half* V_s = V_buf + buf * BN_TILE * D + sub * BN * D;
 
         /* -- WMMA: S = Q × K^T -- */
         wmma::fragment<wmma::accumulator, WM, WMMA_N, WK, float> S_left, S_right;
@@ -221,8 +228,8 @@ __global__ void sparse_attn_wmma_fp16(
 
         /* -- In-register softmax: no S_s needed -- */
         // Load mask words for our two rows
-        uint32_t mword_r0 = (grow_r0 < N) ? mask_packed[mask_base_r0 + tile] : 0u;
-        uint32_t mword_r1 = (grow_r1 < N) ? mask_packed[mask_base_r1 + tile] : 0u;
+        uint32_t mword_r0 = (grow_r0 < N && mask_word < n_words) ? mask_packed[mask_base_r0 + mask_word] : 0u;
+        uint32_t mword_r1 = (grow_r1 < N && mask_word < n_words) ? mask_packed[mask_base_r1 + mask_word] : 0u;
 
         // Apply mask to S values in registers and find per-row max
         float max_r0 = -FLT_MAX, max_r1 = -FLT_MAX;
@@ -320,8 +327,10 @@ __global__ void sparse_attn_wmma_fp16(
             }
         }
 
-        // Wait for next tile's async prefetch, then sync all threads
-        if (tile + 1 < n_words) {
+        } // end sub-tile loop
+
+        // Wait for next 64-col tile's async prefetch, then sync all threads
+        if (tile64 + 1 < n_tiles_64) {
             __pipeline_wait_prior(0);
         }
         __syncthreads();
@@ -447,10 +456,10 @@ void sparse_attention_fwd_fp16(
     int N = params.seq_len;
     dim3 grid(CEIL_DIV(N, BM), params.batch_size * params.num_heads);
     dim3 block(NWARPS * 32);
-    // No S_s needed (in-register softmax). Only Q_s + K/V bufs + P_s.
+    // No S_s needed (in-register softmax). BN_TILE=64 for K/V prefetch.
     int smem_bytes = BM * D * 2             // Q_s
-                   + 2 * BN * D * 2         // K_buf[2]
-                   + 2 * BN * D * 2         // V_buf[2]
+                   + 2 * BN_TILE * D * 2    // K_buf[2] (64-col tiles)
+                   + 2 * BN_TILE * D * 2    // V_buf[2] (64-col tiles)
                    + NWARPS * WM * P_STRIDE * 2;  // P_s (padded)
 
     // Request extended shared memory if needed (>48KB)
