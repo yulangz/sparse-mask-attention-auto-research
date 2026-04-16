@@ -18,4 +18,5 @@ round,optimization,latency_ms,tflops,mfu_pct,accepted,notes
 16,vectorized K/V loading (float4),47.386,17.40,15.1,yes,1.05x over R9; 9.38x vs baseline; reduced load instruction count
 17,NWARPS=4 + vectorized + mask precompute,49.238,16.75,14.6,no,slightly worse than NWARPS=8; reverted
 18,cp.async double-buffered K/V prefetch,44.888,18.37,16.0,yes,1.06x over R16; 9.9x vs baseline; overlaps memory with compute
+19,S/P smem merge (reuse S_s for P),46.122,17.88,15.6,no,slight regression from layout conflicts; reverted
 16,vectorized K/V loading (float4),47.386,17.40,15.1,yes,1.05x over R9; 9.38x vs baseline; reduced load instruction count
