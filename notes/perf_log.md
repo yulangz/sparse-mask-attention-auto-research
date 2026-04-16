@@ -71,6 +71,21 @@ Analysis: Clean 8% gain from reducing bank conflicts in the S→softmax→P shar
 round-trip, which is the hottest path (executed 512× per block). Smem increased from 57KB
 to 63KB but still fits 3 blocks/SM (registers remain the limiter at 67/thread).
 
+## Round 25: In-Register Softmax + Direct Fragment Output
+- **Change**: Eliminated S_s shared memory entirely. Softmax now operates directly on WMMA
+  accumulator fragment values in registers. Each thread handles 2 rows (my_r0, my_r1) via
+  octet-level reductions (__shfl_xor with masks 1,2). Also replaced serial 8-warp output
+  loop with direct fragment-to-global writes using elem_rows/elem_cols mapping.
+  Computed elem_cols via combined row*16+col identity matrix trick.
+- **Latency**: 39.576 ms (was 41.5 ms)
+- **TFLOPS**: 20.84 (was 19.87)
+- **Speedup**: 1.05x over R24, **11.23x** vs baseline
+- **Status**: ACCEPTED
+
+Analysis: 5% gain from eliminating S_s store/load (17KB per tile × 512 tiles) and replacing
+the serial 8-warp output with parallel direct writes. Smem dropped from 63KB to 42KB.
+Register pressure increased (elem_cols[8] + 2 running states) but stays within limits.
+
 **Key breakthroughs** (in order of impact):
 1. **R8**: Fragment O accumulation w/ runtime row mapping (140→53ms, 2.6x single-round gain)
 2. **R6**: WMMA BN=32 (231→140ms, 1.65x) 
