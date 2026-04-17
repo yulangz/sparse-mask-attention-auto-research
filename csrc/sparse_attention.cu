@@ -71,7 +71,7 @@ void pack_mask_bits(
 #define NWARPS 8
 #define BM (WM * NWARPS)
 #define D_CHUNKS 4
-#define BN_TILE 128         // outer tile width for K/V prefetch
+#define BN_TILE 192         // outer tile width for K/V prefetch (6x BN sub-tiles)
 
 // Helper: issue cp.async for one K/V tile (BN_TILE=64 cols) into smem buffer
 __device__ __forceinline__ void prefetch_kv_tile(
