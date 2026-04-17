@@ -1,245 +1,167 @@
-# Performance Optimization Log
+# Sparse Mask Attention — Performance Optimization Log
 
-## Baseline (Round 0)
-- **Kernel**: Scalar, 1 warp (32 threads) per query row
-- **GPU**: NVIDIA L20Y (132 SMs, compute 9.0)
-- **Config**: B=1, H=12, N=16384, D=64, FP16, mask density ~61.7%
-- **Latency**: 444.392 ms
-- **TFLOPS**: 1.86 (1.6% MFU)
-- **Reference points**: PyTorch Ref 32.3ms, Triton 20.4ms, cuDNN 11.0ms, flash-attn 2.7ms
+## Environment
+- **GPU**: NVIDIA L20Y (132 SMs, compute 9.0, Ada/Hopper architecture)
+- **Peak FP16 Tensor Core**: ~114.9 TFLOPS (estimated)
+- **Benchmark config**: B=1, H=12, N=16384, D=64, FP16, mask density ~61.7%
+- **Sparsity pattern**: upper-triangular + 2048 random previous tokens per query
 
-Analysis: The scalar kernel is ~22x slower than our Triton baseline. Key bottlenecks:
-1. Only 32 threads per row — extremely low occupancy
-2. No tensor core usage
-3. No shared memory — all K/V loads go to global memory
-4. Column-by-column iteration — no tiling or reuse
-5. No vectorized loads
+---
 
-## Round 1: Tiled smem K/V caching (BLOCK_M=4, BLOCK_N=32)
-- **Change**: Restructured kernel to use 4 warps per block (one per query row), with
-  cooperative K/V tile loading into shared memory. Each tile = 32 KV columns (one mask word).
-  4 query rows share the same K/V data → 4x reduction in global memory reads.
-- **Latency**: 312.561 ms (was 444.392 ms)
-- **Speedup**: 1.42x
-- **Status**: ACCEPTED
+## Final Result (Round 35)
 
-Analysis: Moderate improvement from better memory reuse and doubled warp occupancy (32→64
-warps/SM). Still memory-latency bound — the per-column inner loop with warp_reduce_sum +
-online softmax is heavy on instruction overhead relative to the small D=64 compute.
+| Metric | Value |
+|--------|-------|
+| **Kernel latency** | **18.84 ms** |
+| **Total latency (kernel + pack_mask)** | **20.82 ms** |
+| **pack_mask latency** | 1.98 ms |
+| **TFLOPS (total)** | 39.61 |
+| **TFLOPS (kernel only)** | 43.78 |
+| **MFU** | 34.5% |
+| **Speedup vs baseline** | **21.4×** |
+| **Registers / thread** | 118 (zero spills) |
+| **Blocks / SM** | 2 |
+| **Shared memory / block** | ~81 KB |
 
-## Summary after 13 Rounds
+---
+
+## Comparison with Other Implementations
+
+All measured at B=1, H=12, N=16384, D=64, FP16 on NVIDIA L20Y.
+
+| Implementation | Latency (ms) | TFLOPS | Mask Support | vs Ours (total) |
+|:---------------|:-------------|:-------|:-------------|:----------------|
+| flash-attn 2 | 2.66 | 310.0 | dense only | 0.13× (dense) |
+| cuDNN SDPA | 11.02 | 74.8 | dense only | 0.53× (dense) |
+| **Ours (kernel)** | **18.84** | **43.8** | **sparse** | — |
+| **Ours (total)** | **20.82** | **39.6** | **sparse** | **baseline** |
+| Triton | 20.41 | 40.4 | sparse | 0.98× |
+| PyTorch Ref | 32.25 | 25.6 | sparse | 1.55× slower |
+| FlashInfer | 71.32 | 11.6 | sparse | 3.43× slower |
+| Baseline (R0) | 444.39 | 1.9 | sparse | 21.4× slower |
+
+**Key takeaway**: Our CUDA kernel (18.84 ms) is **7.6% faster than Triton** (20.41 ms) on
+the attention computation itself. The total (20.82 ms) includes a 1.98 ms pack_mask
+preprocessing step that Triton doesn't need (Triton reads bool masks directly).
+
+---
+
+## Full Optimization History (35 Rounds)
+
+### Phase 1: Foundations (R0–R9) — 444 ms → 50 ms
 
 | Round | Optimization | Latency (ms) | Speedup | Status |
-|-------|-------------|-------------|---------|--------|
-| 0 | Baseline (scalar 1-warp) | 444.4 | 1.00x | - |
-| 1 | Tiled smem K/V (BM=4) | 312.6 | 1.42x | ACCEPT |
-| 2 | BLOCK_M=16 (16 warps) | 236.6 | 1.88x | ACCEPT |
-| 3 | BLOCK_N=128 | 252.1 | - | REJECT |
-| 4 | Column-split 16 warps | 236.9 | - | REJECT |
-| 5 | WMMA TC BN=16 (smem O) | 231.2 | 1.92x | ACCEPT |
-| 6 | WMMA BN=32 (halved tiles) | 140.3 | 3.17x | ACCEPT |
-| 7 | Block-level mask skip | 141.5 | - | REJECT |
-| 8 | Fragment O_acc + runtime row mapping | 53.1 | 8.36x | ACCEPT |
-| 9 | NWARPS=8 (BM=128) | **49.9** | **8.91x** | **ACCEPT** |
-| 10 | Q from global/L2 | 52.1 | - | REJECT |
-| 11 | Warp-level mask skip | 50.4 | - | REJECT |
-| 12 | BN=64 | 60.4 | - | REJECT |
-| 13 | Two-pass softmax | 58.8 | - | REJECT |
+|:------|:-------------|:-------------|:--------|:-------|
+| 0 | Baseline: scalar, 1 warp/row | 444.4 | 1.00× | — |
+| 1 | Tiled smem K/V (BM=4, BN=32, 4 warps) | 312.6 | 1.42× | ACCEPT |
+| 2 | BLOCK_M=16 (16 warps, 512 threads) | 236.6 | 1.88× | ACCEPT |
+| 3 | BLOCK_N=128 larger tiles | 252.1 | — | REJECT |
+| 4 | Column-split 16 warps/row | 236.9 | — | REJECT |
+| 5 | WMMA tensor cores (BN=16, smem O) | 231.2 | 1.92× | ACCEPT |
+| 6 | WMMA BN=32 (halved tile count) | 140.3 | 3.17× | ACCEPT |
+| 7 | Block-level mask skip | 141.5 | — | REJECT |
+| 8 | **Fragment O_acc + runtime row mapping** | **53.1** | **8.36×** | **ACCEPT** |
+| 9 | NWARPS=8 (BM=128, doubled K/V sharing) | 49.9 | 8.91× | ACCEPT |
 
-**Current best**: 47.4 ms (17.40 TFLOPS, 15.1% MFU) — R16 vectorized loads
-**Key breakthroughs**: WMMA tensor cores (R5-R6), fragment O accumulation with runtime
-mapping (R8), larger BLOCK_M for K/V sharing (R9), vectorized float4 loads (R16).
+### Phase 2: Memory Optimization (R10–R23) — 50 ms → 44.6 ms
 
-| 16 | Vectorized K/V float4 loads | **47.4** | **9.38x** | **ACCEPT** |
-| 18 | cp.async double-buffered K/V | **44.9** | **9.90x** | **ACCEPT** |
-| 20 | Alpha via shuffle (no smem) | **44.6** | **9.96x** | **ACCEPT** |
-| 14-15,17,19,21-23 | Various attempts | - | - | ALL REJECT |
+| Round | Optimization | Latency (ms) | Speedup | Status |
+|:------|:-------------|:-------------|:--------|:-------|
+| 10–15 | Various (Q global, mask skip, BN=64, …) | — | — | ALL REJECT |
+| 16 | Vectorized K/V loading (float4) | 47.4 | 9.38× | ACCEPT |
+| 17 | NWARPS=4 + vectorized | 49.2 | — | REJECT |
+| 18 | cp.async double-buffered K/V prefetch | 44.9 | 9.90× | ACCEPT |
+| 19 | S/P smem merge | 46.1 | — | REJECT |
+| 20 | Alpha via shuffle (no smem round-trip) | 44.6 | 9.96× | ACCEPT |
+| 21–23 | Direct output / reg reduction / maxreg | — | — | ALL REJECT |
 
-**Final best**: 44.6 ms (18.48 TFLOPS, 16.1% MFU) — R20
-From 444.4ms to 44.6ms = **9.96x speedup** over 23 optimization rounds.
+### Phase 3: Smem Elimination (R24–R29) — 44.6 ms → 20.8 ms (total)
 
-## Round 24: Smem Padding for S_s/P_s (Bank Conflict Reduction)
-- **Change**: Added stride padding to S_s (float, stride 32→36) and P_s (half, stride 32→48)
-  to break 128-byte bank alignment. S_STRIDE*4=144B (144%128=16, offset by 4 banks),
-  P_STRIDE*2=96B. Eliminates worst-case 16-way bank conflicts in softmax smem accesses.
-- **Latency**: 41.506 ms (was 44.6 ms)
-- **TFLOPS**: 19.87 (was 18.48)
-- **Speedup**: 1.08x over R20, **10.71x** vs baseline
-- **Status**: ACCEPTED
+| Round | Optimization | Total (ms) | Kernel (ms) | Status |
+|:------|:-------------|:-----------|:------------|:-------|
+| 24 | S_s/P_s bank-conflict padding | 41.5 | 28.0 | ACCEPT |
+| 25 | **In-register softmax + direct output** | 39.6 | 26.1 | **ACCEPT** |
+| 26 | BN_TILE=64 (2×32 sub-tiles) | 37.7 | 24.2 | ACCEPT |
+| 27 | BN_TILE=128 (4×32 sub-tiles) | 36.8 | 23.3 | ACCEPT |
+| 28 | **Vectorized pack_mask (__ballot_sync)** | **25.3** | 23.3 | **ACCEPT** |
+| 29 | **launch_bounds occupancy fix (128 regs)** | **22.3** | **20.4** | **ACCEPT** |
 
-Analysis: Clean 8% gain from reducing bank conflicts in the S→softmax→P shared memory
-round-trip, which is the hottest path (executed 512× per block). Smem increased from 57KB
-to 63KB but still fits 3 blocks/SM (registers remain the limiter at 67/thread).
+### Phase 4: Register-Only P@V (R30–R35) — 20.8 ms (total) / 18.8 ms (kernel)
 
-## Round 25: In-Register Softmax + Direct Fragment Output
-- **Change**: Eliminated S_s shared memory entirely. Softmax now operates directly on WMMA
-  accumulator fragment values in registers. Each thread handles 2 rows (my_r0, my_r1) via
-  octet-level reductions (__shfl_xor with masks 1,2). Also replaced serial 8-warp output
-  loop with direct fragment-to-global writes using elem_rows/elem_cols mapping.
-  Computed elem_cols via combined row*16+col identity matrix trick.
-- **Latency**: 39.576 ms (was 41.5 ms)
-- **TFLOPS**: 20.84 (was 19.87)
-- **Speedup**: 1.05x over R24, **11.23x** vs baseline
-- **Status**: ACCEPTED
+| Round | Optimization | Total (ms) | Kernel (ms) | Status |
+|:------|:-------------|:-----------|:------------|:-------|
+| 30–32 | BN_TILE sweep / 3-block / NWARPS=16 | — | — | ALL REJECT |
+| 33 | **Eliminate P_s (acc↔mat_a layout match)** | 21.2 | **19.2** | **ACCEPT** |
+| 34 | BN_TILE=192 (max 2-block smem budget) | 21.0 | 19.1 | ACCEPT |
+| 35 | **Hardcode WMMA layout (0 spills, 118 regs)** | **20.8** | **18.8** | **ACCEPT** |
 
-Analysis: 5% gain from eliminating S_s store/load (17KB per tile × 512 tiles) and replacing
-the serial 8-warp output with parallel direct writes. Smem dropped from 63KB to 42KB.
-Register pressure increased (elem_cols[8] + 2 running states) but stays within limits.
+---
 
-## Round 26: BN_TILE=64 (2×32 Sub-Tiles per Prefetch)
-- **Change**: Doubled the outer tile width to 64 columns for K/V prefetch while keeping
-  BN=32 for sub-tile WMMA processing. Each 64-col tile processes 2 sub-tiles of 32 cols.
-  K/V buffers doubled (8KB→16KB each). Halves the number of __syncthreads, cp.async
-  prefetches, and pipeline commits.
-- **Latency**: 37.710 ms (was 39.6 ms)
-- **TFLOPS**: 21.87 (was 20.84)
-- **Speedup**: 1.05x over R25, **11.78x** vs baseline
-- **Status**: ACCEPTED
+## Key Breakthroughs (ranked by single-round impact)
 
-Analysis: 5% gain from reducing synchronization and prefetch overhead (256 syncs instead of
-512). Smem increased from 42KB to 58KB (larger K/V buffers) but still 3 blocks/SM.
+1. **R8 — Fragment O accumulation** (140→53 ms, **2.64×**):
+   Eliminated shared memory round-trip for output by accumulating directly in WMMA
+   accumulator fragments. Used runtime identity-matrix probe to discover fragment layout.
 
-## Round 27: BN_TILE=128 (4×32 Sub-Tiles per Prefetch)
-- **Change**: Further doubled outer tile to 128 columns (4 sub-tiles of 32). K/V buffers
-  now 32KB each. Smem 92KB → 2 blocks/SM (was 3). Reduces syncs from 256 to 128.
-- **Latency**: 36.755 ms total (23.304 ms kernel-only)
-- **TFLOPS**: 22.44 total / 35.39 kernel-only
-- **Speedup**: 1.03x over R26
-- **Status**: ACCEPTED
+2. **R6 — WMMA BN=32** (231→140 ms, **1.65×**):
+   Halved the number of KV tiles by doubling the WMMA tile width. Split P@V into two
+   16×16 sub-tiles to keep within WMMA dimensions.
 
-**Key discovery**: pack_mask takes **13.5ms** — 37% of total time! All prior measurements
-included this overhead. Kernel-only: 23.3ms vs Triton 20.4ms = only 1.14× gap.
+3. **R28 — Vectorized pack_mask** (36.8→25.3 ms total, **1.45×**):
+   Replaced scalar bit-by-bit mask packing with warp-level `__ballot_sync()`. One intrinsic
+   packs 32 bools → 1 uint32, with coalesced global memory reads.
 
-## Round 28: Vectorized pack_mask (__ballot_sync)
-- **Change**: Replaced scalar per-bit pack_mask with warp-level __ballot_sync. One warp
-  packs 32 bools → 1 uint32 in a single intrinsic. Coalesced 32-byte reads.
-- **pack_mask latency**: 1.983 ms (was 13.452 ms) — **6.8× speedup**
-- **Total latency**: 25.290 ms (was 36.755 ms)
-- **TFLOPS**: 32.61 total (was 22.44)
-- **Speedup**: 1.45x over R27 total, **17.6x** vs baseline
-- **Status**: ACCEPTED
+4. **R29 — Occupancy fix via launch_bounds** (25.3→22.3 ms, **1.13×**):
+   Discovered register explosion (193 regs → 1 block/SM) from sub-tile loop unrolling.
+   `__launch_bounds__(256, 2)` forced 128 regs → 2 blocks/SM = 2× occupancy.
 
-## Round 29: __launch_bounds__ + Remove Sub-Tile Unroll
-- **Change**: Added `__launch_bounds__(256, 2)` to force 2 blocks/SM. Removed `#pragma
-  unroll` from the sub-tile loop (was causing register explosion: 193→133 regs).
-  With launch_bounds, compiler targets 128 regs (20B spill, negligible).
-- **Kernel latency**: 20.355 ms (was 23.3 ms) — **12.6% improvement**
-- **Total latency**: 22.339 ms (was 25.3 ms)
-- **TFLOPS**: 40.51 kernel / 36.91 total
-- **Speedup**: **19.88×** vs baseline, kernel matches Triton (20.4ms)!
-- **Status**: ACCEPTED
+5. **R25 — In-register softmax** (41.5→39.6 ms, **1.05×**):
+   Computed softmax directly on WMMA accumulator values using octet-level warp shuffles
+   (XOR masks 1, 2). Eliminated S_s shared memory buffer entirely.
 
-**Key insight**: Register pressure was the hidden bottleneck. With 193 regs, only 1 block/SM
-(8 warps). At 128 regs, 2 blocks/SM (16 warps) — 2× occupancy = 12% faster.
+6. **R33 — Eliminate P_s via layout identity** (22.3→21.2 ms, **1.05×**):
+   Probed WMMA matrix_a fragment layout and discovered it is **identical** to the accumulator
+   layout on sm_90. P values from softmax directly populate matrix_a fragments in registers —
+   no shared memory store/load needed. Zero-cost P@V operand construction.
 
-**Updated comparison at B=1, N=16384, H=12, D=64 (FP16):**
+---
+
+## Architecture of Final Kernel (R35)
+
 ```
-flash-attn:      2.65ms  (311 TFLOPS)  dense, no mask
-cuDNN SDPA:     11.02ms  ( 75 TFLOPS)  dense
-Triton:         20.40ms  ( 40 TFLOPS)  sparse     ← 1.00× (kernel parity!)
-Ours (R29):     22.34ms  ( 37 TFLOPS)  sparse     ← HERE (total w/ pack_mask)
-  kernel-only:  20.36ms  ( 41 TFLOPS)                  (matches Triton!)
-PyTorch Ref:    32.26ms  ( 26 TFLOPS)  sparse     ← 1.44× slower
-FlashInfer:     71.20ms  ( 12 TFLOPS)  sparse     ← 3.19× slower
-Baseline:      444.39ms  (  2 TFLOPS)  scalar     ← 19.9× slower
+Grid:  [ceil(N/BM), B*H]  = [128, 12] = 1536 blocks
+Block: NWARPS × 32        = 256 threads
+BM=128 (Q rows per block), BN=32 (sub-tile KV cols), BN_TILE=192 (prefetch cols)
+
+Shared memory (81 KB):
+  Q_s   [128, 64]  __half  — 16 KB   (loaded once, reused every sub-tile)
+  K_buf [2×192, 64] __half — 48 KB   (double-buffered, cp.async prefetch)
+  V_buf [2×192, 64] __half — 48 KB   (double-buffered, cp.async prefetch)
+  (no S_s, no P_s — everything in registers)
+
+Per sub-tile (32 KV columns):
+  1. WMMA QK^T:   8× mma_sync (Q from smem, K from smem → S in registers)
+  2. Softmax:     in-register mask + max + exp + sum (octet shuffles)
+  3. P fragment:  direct register construction (acc layout == mat_a layout)
+  4. WMMA P@V:    8× mma_sync (P from registers, V from smem → O_acc in registers)
+
+Outer tile loop: 192-col tiles, 6× sub-tiles each, double-buffered K/V prefetch.
+Online softmax across tiles: per-thread running state for 2 rows (my_r0, my_r1).
+Output: direct register-to-global writes using hardcoded WMMA layout.
 ```
 
-## Rounds 30-32: Rejected Attempts
-- **R30**: BN_TILE=64 → 21.0ms kernel (worse, reverted)
-- **R30b**: BN_TILE=256 → 22.8ms kernel (worse, smem pressure)
-- **R31**: launch_bounds(256,3) → 80 regs, 340B spills → 23.2ms (worse)
-- **R32**: NWARPS=16 (BM=256) → 20.8ms kernel (slightly worse, less scheduling flexibility)
-BN_TILE=128, NWARPS=8, 2 blocks/SM remains optimal.
+---
 
-## Round 33-35: Eliminate P_s + Hardcode Layout
-- **R33**: Discovered accumulator and matrix_a layouts are IDENTICAL on sm_90.
-  Eliminated P_s smem entirely — construct P fragments directly in registers.
-  Kernel: 19.24ms → 19.07ms.
-- **R34**: BN_TILE=192 (optimal for 2-block smem budget). Kernel: 19.07ms.
-- **R35**: Hardcoded WMMA layout (eliminate runtime probe + 16 int registers).
-  118 registers, ZERO spills. Kernel: **18.84ms (43.8 TFLOPS)**.
+## Sequence Length Scaling (Final Kernel)
 
-**Current best (R35)**: 20.8ms total / 18.8ms kernel — **21.4× vs baseline, 7.6% faster than Triton**
-
-| Round | Optimization | Kernel (ms) | Total (ms) | TFLOPS | Status |
-|-------|-------------|-------------|------------|--------|--------|
-| R24 | S_s/P_s smem padding | 28.0 | 41.5 | 19.87 | ACCEPT |
-| R25 | In-register softmax + direct output | 26.1 | 39.6 | 20.84 | ACCEPT |
-| R26 | BN_TILE=64 sub-tiles | 24.2 | 37.7 | 21.87 | ACCEPT |
-| R27 | BN_TILE=128 sub-tiles | 23.3 | 36.8 | 22.44 | ACCEPT |
-| R28 | Vectorized pack_mask | 23.3 | 25.3 | 32.61 | ACCEPT |
-| R29 | launch_bounds + occupancy fix | 20.4 | 22.3 | 36.91 | ACCEPT |
-| R33 | Eliminate P_s (register P fragment) | 19.2 | 21.2 | 38.85 | ACCEPT |
-| R34 | BN_TILE=192 | 19.1 | 21.0 | 39.18 | ACCEPT |
-| R35 | Hardcode WMMA layout | **18.8** | **20.8** | **39.61** | **ACCEPT** |
-
-**Final comparison at B=1, N=16384, H=12, D=64 (FP16):**
-```
-flash-attn:      2.66ms  (310 TFLOPS)  dense, no mask
-cuDNN SDPA:     11.02ms  ( 75 TFLOPS)  dense
-Ours (R35):     20.82ms  ( 40 TFLOPS)  sparse     ← FASTEST sparse!
-  kernel-only:  18.84ms  ( 44 TFLOPS)                  (7.6% faster than Triton!)
-Triton:         20.42ms  ( 40 TFLOPS)  sparse     ← now 2% slower (total parity)
-PyTorch Ref:    32.26ms  ( 26 TFLOPS)  sparse     ← 1.55× slower
-FlashInfer:     71.31ms  ( 12 TFLOPS)  sparse     ← 3.43× slower
-Baseline:      444.39ms  (  2 TFLOPS)  scalar     ← 21.4× slower
-```
-
-## Round 33: Eliminate P_s Smem (Direct Register P Fragment)
-- **Change**: Discovered that WMMA accumulator and matrix_a fragment layouts are **IDENTICAL**
-  on sm_90 (probed at runtime). Elements 0-7 match exactly; matrix_a elements 8-15 are
-  duplicates of 0-7. This means P values from softmax (in accumulator layout) can directly
-  populate matrix_a fragments without any shuffles or shared memory.
-  Eliminated P_s entirely: no smem stores, no syncwarp, no WMMA loads.
-  Smem dropped from 93KB to 81KB.
-- **Kernel latency**: **19.238 ms** (was 20.355 ms) — **5.5% faster, beats Triton!**
-- **Total latency**: **21.225 ms** (was 22.339 ms)
-- **TFLOPS**: 42.87 kernel / 38.85 total
-- **Speedup**: **20.9×** vs baseline, **1.06× faster than Triton (20.4ms)**
-- **Status**: ACCEPTED
-
-**Updated comparison at B=1, N=16384, H=12, D=64 (FP16):**
-```
-flash-attn:      2.65ms  (311 TFLOPS)  dense, no mask
-cuDNN SDPA:     11.02ms  ( 75 TFLOPS)  dense
-Ours (R33):     19.24ms  ( 43 TFLOPS)  sparse     ← FASTEST sparse! beats Triton!
-  total:        21.23ms  ( 39 TFLOPS)                  (with pack_mask)
-Triton:         20.40ms  ( 40 TFLOPS)  sparse     ← 1.06× slower (kernel only)
-PyTorch Ref:    32.26ms  ( 26 TFLOPS)  sparse     ← 1.68× slower
-FlashInfer:     71.20ms  ( 12 TFLOPS)  sparse     ← 3.70× slower
-Baseline:      444.39ms  (  2 TFLOPS)  scalar     ← 23.1× slower
-```
-
-## Summary: Rounds 24-32
-
-| Round | Optimization | Kernel (ms) | Total (ms) | Status |
-|-------|-------------|-------------|------------|--------|
-| R24 | S_s/P_s smem padding | 28.0 | 41.5 | ACCEPT |
-| R25 | In-register softmax + direct output | 26.1 | 39.6 | ACCEPT |
-| R26 | BN_TILE=64 (2x sub-tiles) | 24.2 | 37.7 | ACCEPT |
-| R27 | BN_TILE=128 (4x sub-tiles) | 23.3 | 36.8 | ACCEPT |
-| R28 | Vectorized pack_mask (__ballot_sync) | 23.3 | 25.3 | ACCEPT |
-| R29 | launch_bounds + occupancy fix | **20.4** | **22.3** | ACCEPT |
-| R30-32 | BN_TILE/NWARPS/occupancy sweeps | — | — | REJECT |
-
-**Current best**: 22.3ms total / 20.4ms kernel — **19.9× vs baseline, parity with Triton**
-From 444.4ms → 22.3ms over 32 optimization rounds.
-
-**Key breakthroughs** (in order of impact):
-1. **R8**: Fragment O accumulation w/ runtime row mapping (140→53ms, 2.6x single-round gain)
-2. **R6**: WMMA BN=32 (231→140ms, 1.65x) 
-3. **R2**: BLOCK_M=16 for K/V sharing (312→237ms, 1.32x)
-4. **R18**: cp.async double-buffered K/V prefetch (47→45ms)
-5. **R20**: Alpha via shuffle (no smem round-trip)
-
-**Comparison at B=1, N=16384, H=12, D=64 (FP16):**
-```
-flash-attn:     2.65ms  (311 TFLOPS)  dense, no mask
-cuDNN SDPA:    11.02ms  ( 75 TFLOPS)  dense
-Triton:        20.40ms  ( 40 TFLOPS)  sparse     ← 2.2x faster
-PyTorch Ref:   32.26ms  ( 26 TFLOPS)  sparse     ← 1.4x faster
-Ours (R20):    44.63ms  ( 18 TFLOPS)  sparse     ← HERE
-FlashInfer:    71.20ms  ( 12 TFLOPS)  sparse     ← 1.6x slower
-Baseline:     444.39ms  (  2 TFLOPS)  scalar     ← 10x slower
-```
-
+| N | B | Latency (ms) | TFLOPS | MFU% | Density% |
+|---:|---:|---:|---:|---:|---:|
+| 64 | 16 | 0.025 | 8.13 | 7.1 | 100.0 |
+| 128 | 16 | 0.041 | 19.66 | 17.1 | 100.0 |
+| 256 | 16 | 0.123 | 26.26 | 22.9 | 100.0 |
+| 512 | 16 | 0.363 | 35.47 | 30.9 | 100.0 |
+| 1024 | 16 | 1.357 | 37.99 | 33.1 | 100.0 |
+| 2048 | 4 | 1.335 | 38.62 | 33.6 | 100.0 |
+| 4096 | 4 | 5.248 | 39.28 | 34.2 | 87.5 |
+| 8192 | 2 | 10.432 | 39.53 | 34.4 | 71.9 |
+| 16384 | 1 | 20.817 | 39.61 | 34.5 | 61.7 |

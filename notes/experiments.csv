@@ -23,7 +23,6 @@ round,optimization,latency_ms,tflops,mfu_pct,accepted,notes
 21,direct fragment-to-global output (skip smem),45.670,18.05,15.7,no,correctness failure (fragment layout issue); reverted
 22,r0_mask register reduction (replace elem_rows),45.385,18.17,15.8,no,BACKFIRE: 137 regs (was 67); ternary prevents loop opt; reverted
 23,--maxrregcount=64 (force 4 blocks/SM),46.110,17.88,15.6,no,spills outweigh occupancy gain; reverted
-16,vectorized K/V loading (float4),47.386,17.40,15.1,yes,1.05x over R9; 9.38x vs baseline; reduced load instruction count
 24,smem padding S_s/P_s (S_STRIDE=36 P_STRIDE=48),41.506,19.87,17.3,yes,1.08x over R20; 10.71x vs baseline; bank conflict reduction
 25,in-register softmax + direct fragment output,39.576,20.84,18.1,yes,1.05x over R24; 11.23x vs baseline; eliminated S_s smem + serial output
 26,BN_TILE=64 (2x32 sub-tiles per prefetch),37.710,21.87,19.0,yes,1.05x over R25; 11.78x vs baseline; halved syncs + prefetches
