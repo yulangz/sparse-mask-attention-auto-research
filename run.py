@@ -1047,18 +1047,44 @@ def dense_decode_flash(q, k_cache, v_cache):
     return out.transpose(1, 2)
 
 
+def pytorch_ref_decode(q, k_cache, v_cache, mask_bool, scale):
+    """PyTorch reference: full Q×K^T with bool mask, then softmax, then ×V."""
+    scores = torch.matmul(q.float(), k_cache.float().transpose(-2, -1)) * scale
+    scores = scores.masked_fill(~mask_bool, float("-inf"))
+    attn = torch.softmax(scores, dim=-1)
+    attn = torch.nan_to_num(attn, nan=0.0)
+    return torch.matmul(attn, v_cache.float()).to(q.dtype)
+
+
+def ours_prefill_decode(q_padded, k_padded, v_padded, mask_packed, scale, N):
+    """Our CUDA prefill kernel used for decode (Q padded to kv_len)."""
+    B, H, Np, D = q_padded.shape
+    out = torch.empty_like(q_padded)
+    lse = torch.empty(B, H, Np, device=q_padded.device, dtype=torch.float32)
+    sparse_attn_cuda.forward(
+        q_padded, k_padded, v_padded, mask_packed, out, lse, scale, False
+    )
+    return out
+
+
 def run_decode():
     """
     Decode 场景测试：Q 长度 1-4，KV cache 长度 4K-128K。
-    对比 sparse gather (attend 2048) vs dense (attend all)。
+    横向对比所有实现：
+      1. Sparse Gather (PyTorch gather+matmul, attend 2048)
+      2. PyTorch Ref   (masked full Q×K^T, attend 2048 — 全量计算+mask)
+      3. Our Prefill   (CUDA kernel, Q padded to kv_len — N×N prefill)
+      4. cuDNN SDPA    (dense, attend all)
+      5. flash-attn    (dense, attend all)
+      6. FlashInfer    (dense, attend all)
     """
-    print("=" * 100)
-    print("Decode 场景测试 — Sparse Gather vs Dense Full Attention")
-    print("=" * 100)
-    print("  Q: 新生成的 token (1=标准decode, 2-4=MTP 场景)")
-    print("  KV: 已有的 KV cache")
-    print("  Sparse: 每个 query 只 attend 2048 个随机 KV 位置")
-    print("  Dense: 每个 query attend 全部 KV 位置")
+    print("=" * 120)
+    print("Decode 场景测试 — 全实现横向对比")
+    print("=" * 120)
+    print("  Q: 新生成的 token (q_len=1 标准 decode, 2-4 为 MTP 场景)")
+    print("  KV cache: 已有上下文, 长度 kv_len")
+    print("  Sparse (attend 2048): 每 query 仅关注 2048 个随机 KV 位置")
+    print("  Dense  (attend all):  每 query 关注全部 kv_len 个位置")
     print()
 
     B = 1
@@ -1072,80 +1098,132 @@ def run_decode():
 
     scale = 1.0 / math.sqrt(D)
 
-    # Header
+    warmup, repeat = 10, 50
+
+    def lat_or_nan(fn, w=warmup, r=repeat):
+        try:
+            return measure_latency(fn, warmup=w, repeat=r)
+        except Exception as e:
+            return float("nan")
+
+    def fmt(v):
+        if math.isnan(v):
+            return "   —    "
+        return f"{v:>8.3f}"
+
     print(f"  B={B}, H={H}, D={D}, num_attend={num_attend}, dtype=FP16")
     print()
-    print(
-        f"  {'kv_len':>8}  {'q_len':>5}  {'Sparse(ms)':>11}  {'cuDNN(ms)':>10}  "
-        f"{'flash(ms)':>10}  {'Speedup_cuDNN':>13}  {'Speedup_flash':>13}  "
-        f"{'Sparse/Dense':>12}"
-    )
-    print("  " + "-" * 96)
 
+    # ── Per kv_len ──────────────────────────────────────────────
     for kv_len in kv_lens:
         k_cache = torch.randn(B, H, kv_len, D, device=device, dtype=dtype)
         v_cache = torch.randn(B, H, kv_len, D, device=device, dtype=dtype)
 
+        density = min(num_attend, kv_len) / kv_len * 100
+
+        print(
+            f"  ┌── kv_len = {kv_len:,}  (sparse attend {density:.1f}%  = {min(num_attend, kv_len)}/{kv_len}) ──"
+        )
+        print(
+            f"  │ {'q_len':>5}  {'Gather':>8}  {'PyRef':>8}  {'Ours':>8}  "
+            f"{'cuDNN':>8}  {'flash':>8}  {'FlashInf':>8}  │ fastest"
+        )
+        print(
+            f"  │       {'(sparse)':>8}  {'(sparse)':>8}  {'(sparse)':>8}  "
+            f"{'(dense)':>8}  {'(dense)':>8}  {'(dense)':>8}  │"
+        )
+        print(
+            f"  │ {'':>5}  {'ms':>8}  {'ms':>8}  {'ms':>8}  "
+            f"{'ms':>8}  {'ms':>8}  {'ms':>8}  │"
+        )
+        print(f"  │ " + "─" * 73 + " │")
+
+        # Precompute mask for our prefill kernel and PyTorch ref
+        # Sparse mask: each of q_len queries attends to num_attend random positions
+        # Build a [B, H, kv_len, kv_len] mask? No — too large at 64K.
+        # For our prefill kernel: Q padded to kv_len. Only last q_len rows matter.
+        # We only need mask for the last q_len rows.
+        # But our kernel expects [B, H, N, N] mask with N=kv_len.
+        # Note: our prefill CUDA kernel computes O(kv_len²), unsuitable for decode.
+
         for q_len in q_lens:
             q = torch.randn(B, H, q_len, D, device=device, dtype=dtype)
-
-            # Sparse indices: each query attends to num_attend random KV positions
             indices = torch.randint(
                 0, kv_len, (B, H, min(num_attend, kv_len)), device=device
             )
 
-            # Sparse decode
-            try:
-                lat_sp = measure_latency(
-                    lambda: sparse_decode_flat(q, k_cache, v_cache, indices, scale),
-                    warmup=20,
-                    repeat=100,
-                )
-            except Exception:
-                lat_sp = float("nan")
+            results = {}
 
-            # Dense: cuDNN SDPA
-            try:
-                lat_cudnn = measure_latency(
-                    lambda: dense_decode_sdpa(q, k_cache, v_cache),
-                    warmup=20,
-                    repeat=100,
-                )
-            except Exception:
-                lat_cudnn = float("nan")
-
-            # Dense: flash-attn
-            if HAS_FLASH_ATTN:
-                try:
-                    lat_flash = measure_latency(
-                        lambda: dense_decode_flash(q, k_cache, v_cache),
-                        warmup=20,
-                        repeat=100,
-                    )
-                except Exception:
-                    lat_flash = float("nan")
-            else:
-                lat_flash = float("nan")
-
-            # Compute speedups
-            sp_cudnn = lat_cudnn / lat_sp if lat_sp > 0 else float("nan")
-            sp_flash = lat_flash / lat_sp if lat_sp > 0 else float("nan")
-            density = min(num_attend, kv_len) / kv_len * 100
-
-            print(
-                f"  {kv_len:>8}  {q_len:>5}  {lat_sp:>10.3f}  {lat_cudnn:>9.3f}  "
-                f"{lat_flash:>9.3f}  {sp_cudnn:>12.2f}×  {sp_flash:>12.2f}×  "
-                f"attend {density:.1f}%"
+            # 1. Sparse Gather (PyTorch)
+            results["Gather"] = lat_or_nan(
+                lambda: sparse_decode_flat(q, k_cache, v_cache, indices, scale)
             )
 
+            # 2. PyTorch Ref (masked full attention)
+            # Build small mask [B, H, q_len, kv_len] — affordable
+            mask_bool = torch.zeros(
+                B, H, q_len, kv_len, dtype=torch.bool, device=device
+            )
+            idx2d = indices.unsqueeze(2).expand(B, H, q_len, min(num_attend, kv_len))
+            mask_bool.scatter_(-1, idx2d, True)
+            results["PyRef"] = lat_or_nan(
+                lambda: pytorch_ref_decode(q, k_cache, v_cache, mask_bool, scale)
+            )
+
+            # 3. Our Prefill kernel — NOT benchmarked for decode.
+            # It computes O(kv_len²) for the full N×N attention, which is
+            # fundamentally wrong for decode (should be O(q_len × kv_len)).
+            results["Ours"] = float("nan")
+
+            # 4. cuDNN SDPA (dense)
+            results["cuDNN"] = lat_or_nan(
+                lambda: dense_decode_sdpa(q, k_cache, v_cache)
+            )
+
+            # 5. flash-attn (dense)
+            if HAS_FLASH_ATTN:
+                results["flash"] = lat_or_nan(
+                    lambda: dense_decode_flash(q, k_cache, v_cache)
+                )
+            else:
+                results["flash"] = float("nan")
+
+            # 6. FlashInfer — skip (API mismatch for decode scenario)
+            results["FlashInf"] = float("nan")
+
+            # Find fastest
+            valid = {k: v for k, v in results.items() if not math.isnan(v)}
+            fastest = min(valid, key=valid.get) if valid else "—"
+
+            print(
+                f"  │ {q_len:>5}  {fmt(results['Gather'])}  {fmt(results['PyRef'])}  "
+                f"{fmt(results.get('Ours', float('nan')))}  {fmt(results['cuDNN'])}  "
+                f"{fmt(results['flash'])}  {fmt(results.get('FlashInf', float('nan')))}  "
+                f"│ {fastest}"
+            )
+
+            del q, mask_bool
+            torch.cuda.empty_cache()
+
+        print(f"  └" + "─" * 75 + "┘")
+        print()
         del k_cache, v_cache
         torch.cuda.empty_cache()
-        print()
 
-    print("  说明:")
-    print("    Speedup >1 表示 sparse 更快，<1 表示 dense 更快")
-    print("    Sparse/Dense 列显示 sparse attend 的 KV 占比")
-    print("    MTP (Multi-Token Prediction): q_len>1 表示同时解码多个 token")
+    # ── Summary ─────────────────────────────────────────────────
+    print("  注释:")
+    print("    Gather   = PyTorch gather + 小矩阵乘 (只加载 2048 个 KV, O(num_attend))")
+    print("    PyRef    = PyTorch Q×K^T + mask + softmax + ×V (加载全部 KV, O(kv_len))")
+    print(
+        "    Ours     = 我们的 CUDA prefill kernel (Q padded 到 kv_len, 计算 N×N, O(kv_len²))"
+    )
+    print("    cuDNN    = cuDNN SDPA dense (attend all, O(kv_len))")
+    print("    flash    = flash-attn dense (attend all, O(kv_len))")
+    print("    FlashInf = FlashInfer dense (attend all, O(kv_len))")
+    print()
+    print("    Gather 是 O(num_attend) — 常数时间，不随 kv_len 增长")
+    print("    PyRef/cuDNN/flash/FlashInfer 是 O(kv_len) — 线性增长")
+    print("    Ours (prefill) 是 O(kv_len²) — 用 prefill kernel 做 decode 极度浪费")
     print()
 
 
