@@ -71,8 +71,7 @@ void pack_mask_bits(
 #define NWARPS 8
 #define BM (WM * NWARPS)
 #define D_CHUNKS 4
-#define BN_TILE 128         // outer tile width for K/V prefetch (4x BN sub-tiles)
-#define P_STRIDE (BN + 16)  // padded stride for half P_s, must be multiple of 16 for WMMA (48 halfs=96B)
+#define BN_TILE 128         // outer tile width for K/V prefetch
 
 // Helper: issue cp.async for one K/V tile (BN_TILE=64 cols) into smem buffer
 __device__ __forceinline__ void prefetch_kv_tile(
@@ -119,12 +118,11 @@ __global__ __launch_bounds__(NWARPS * 32, 2) void sparse_attn_wmma_fp16(
     const int bhND = ((b * H + h) * N) * D;
     const int n_words = (N + 31) / 32;
 
-    /* -------- shared memory: no S_s needed -------- */
+    /* -------- shared memory: only Q + K/V buffers -------- */
     extern __shared__ char smem[];
     __half* Q_s   = (__half*)smem;                                  // [BM, D]
     __half* K_buf = Q_s + BM * D;                                  // [2, BN_TILE, D]
     __half* V_buf = K_buf + 2 * BN_TILE * D;                       // [2, BN_TILE, D]
-    __half* P_s   = (__half*)(V_buf + 2 * BN_TILE * D);            // [NWARPS, WM, P_STRIDE] padded
 
     /* -------- fragment row AND column mapping -------- */
     __half* tmpA = Q_s;
@@ -280,29 +278,31 @@ __global__ __launch_bounds__(NWARPS * 32, 2) void sparse_attn_wmma_fp16(
                 O_acc[d].x[i] *= (elem_rows[i] == my_r0) ? alpha_r0 : alpha_r1;
         }
 
-        // Compute exp, accumulate sum, write P to smem
+        // Compute exp, accumulate sum, construct P fragments directly in registers
         float sum_r0 = 0.0f, sum_r1 = 0.0f;
-        __half* my_P = &P_s[warp_id * WM * P_STRIDE];
+        wmma::fragment<wmma::matrix_a, WM, WMMA_N, WK, __half, wmma::row_major> Pl, Pr;
 
         #pragma unroll
         for (int i = 0; i < 8; i++) {
-            float nm, s_val;
+            float nm;
             int row_local;
 
-            // S_left
+            // S_left → Pl
             row_local = elem_rows[i];
             nm = (row_local == my_r0) ? new_max_r0 : new_max_r1;
-            s_val = S_left.x[i];
-            float p_l = (s_val > -FLT_MAX) ? expf(s_val - nm) : 0.0f;
+            float p_l = (S_left.x[i] > -FLT_MAX) ? expf(S_left.x[i] - nm) : 0.0f;
             if (row_local == my_r0) sum_r0 += p_l; else sum_r1 += p_l;
-            my_P[row_local * P_STRIDE + elem_cols[i]] = __float2half(p_l);
+            __half h_l = __float2half(p_l);
+            Pl.x[i] = h_l;
+            Pl.x[i + 8] = h_l;  // matrix_a layout: elements 8-15 duplicate 0-7
 
-            // S_right
+            // S_right → Pr
             nm = (row_local == my_r0) ? new_max_r0 : new_max_r1;
-            s_val = S_right.x[i];
-            float p_r = (s_val > -FLT_MAX) ? expf(s_val - nm) : 0.0f;
+            float p_r = (S_right.x[i] > -FLT_MAX) ? expf(S_right.x[i] - nm) : 0.0f;
             if (row_local == my_r0) sum_r0 += p_r; else sum_r1 += p_r;
-            my_P[row_local * P_STRIDE + elem_cols[i] + 16] = __float2half(p_r);
+            __half h_r = __float2half(p_r);
+            Pr.x[i] = h_r;
+            Pr.x[i + 8] = h_r;
         }
 
         // Reduce sum across 4 threads in octet
@@ -316,13 +316,8 @@ __global__ __launch_bounds__(NWARPS * 32, 2) void sparse_attn_wmma_fp16(
         running_max_r0 = new_max_r0;
         running_max_r1 = new_max_r1;
 
-        /* -- WMMA: O_acc += P × V -- */
-        __syncwarp();
+        /* -- WMMA: O_acc += P × V (P fragments constructed in registers, no smem) -- */
         {
-            wmma::fragment<wmma::matrix_a, WM, WMMA_N, WK, __half, wmma::row_major> Pl, Pr;
-            wmma::load_matrix_sync(Pl, &P_s[warp_id * WM * P_STRIDE], P_STRIDE);
-            wmma::load_matrix_sync(Pr, &P_s[warp_id * WM * P_STRIDE + 16], P_STRIDE);
-
             #pragma unroll
             for (int dc = 0; dc < D_CHUNKS; dc++) {
                 wmma::fragment<wmma::matrix_b, WM, WMMA_N, WK, __half, wmma::row_major> Vt, Vb;
@@ -462,11 +457,10 @@ void sparse_attention_fwd_fp16(
     int N = params.seq_len;
     dim3 grid(CEIL_DIV(N, BM), params.batch_size * params.num_heads);
     dim3 block(NWARPS * 32);
-    // No S_s needed (in-register softmax). BN_TILE=64 for K/V prefetch.
+    // All-register softmax + P fragments. Only Q_s + K/V buffers in smem.
     int smem_bytes = BM * D * 2             // Q_s
-                   + 2 * BN_TILE * D * 2    // K_buf[2] (64-col tiles)
-                   + 2 * BN_TILE * D * 2    // V_buf[2] (64-col tiles)
-                   + NWARPS * WM * P_STRIDE * 2;  // P_s (padded)
+                   + 2 * BN_TILE * D * 2    // K_buf[2]
+                   + 2 * BN_TILE * D * 2;   // V_buf[2]
 
     // Request extended shared memory if needed (>48KB)
     if (smem_bytes > 48 * 1024) {

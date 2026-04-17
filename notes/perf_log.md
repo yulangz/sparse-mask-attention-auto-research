@@ -151,6 +151,31 @@ Baseline:      444.39ms  (  2 TFLOPS)  scalar     ← 19.9× slower
 - **R32**: NWARPS=16 (BM=256) → 20.8ms kernel (slightly worse, less scheduling flexibility)
 BN_TILE=128, NWARPS=8, 2 blocks/SM remains optimal.
 
+## Round 33: Eliminate P_s Smem (Direct Register P Fragment)
+- **Change**: Discovered that WMMA accumulator and matrix_a fragment layouts are **IDENTICAL**
+  on sm_90 (probed at runtime). Elements 0-7 match exactly; matrix_a elements 8-15 are
+  duplicates of 0-7. This means P values from softmax (in accumulator layout) can directly
+  populate matrix_a fragments without any shuffles or shared memory.
+  Eliminated P_s entirely: no smem stores, no syncwarp, no WMMA loads.
+  Smem dropped from 93KB to 81KB.
+- **Kernel latency**: **19.238 ms** (was 20.355 ms) — **5.5% faster, beats Triton!**
+- **Total latency**: **21.225 ms** (was 22.339 ms)
+- **TFLOPS**: 42.87 kernel / 38.85 total
+- **Speedup**: **20.9×** vs baseline, **1.06× faster than Triton (20.4ms)**
+- **Status**: ACCEPTED
+
+**Updated comparison at B=1, N=16384, H=12, D=64 (FP16):**
+```
+flash-attn:      2.65ms  (311 TFLOPS)  dense, no mask
+cuDNN SDPA:     11.02ms  ( 75 TFLOPS)  dense
+Ours (R33):     19.24ms  ( 43 TFLOPS)  sparse     ← FASTEST sparse! beats Triton!
+  total:        21.23ms  ( 39 TFLOPS)                  (with pack_mask)
+Triton:         20.40ms  ( 40 TFLOPS)  sparse     ← 1.06× slower (kernel only)
+PyTorch Ref:    32.26ms  ( 26 TFLOPS)  sparse     ← 1.68× slower
+FlashInfer:     71.20ms  ( 12 TFLOPS)  sparse     ← 3.70× slower
+Baseline:      444.39ms  (  2 TFLOPS)  scalar     ← 23.1× slower
+```
+
 ## Summary: Rounds 24-32
 
 | Round | Optimization | Kernel (ms) | Total (ms) | Status |
