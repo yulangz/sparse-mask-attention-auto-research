@@ -1125,16 +1125,16 @@ def run_decode():
             f"  ┌── kv_len = {kv_len:,}  (sparse attend {density:.1f}%  = {min(num_attend, kv_len)}/{kv_len}) ──"
         )
         print(
-            f"  │ {'q_len':>5}  {'Gather':>8}  {'PyRef':>8}  {'Ours':>8}  "
-            f"{'cuDNN':>8}  {'flash':>8}  {'FlashInf':>8}  │ fastest"
+            f"  │ {'q_len':>5}  {'Gather':>8}  {'PyRef':>8}  "
+            f"{'cuDNN':>8}  {'flash':>8}  {'FI_spr':>8}  {'FI_dns':>8}  │ fastest"
         )
         print(
-            f"  │       {'(sparse)':>8}  {'(sparse)':>8}  {'(sparse)':>8}  "
-            f"{'(dense)':>8}  {'(dense)':>8}  {'(dense)':>8}  │"
+            f"  │       {'(sparse)':>8}  {'(sparse)':>8}  "
+            f"{'(dense)':>8}  {'(dense)':>8}  {'(sparse)':>8}  {'(dense)':>8}  │"
         )
         print(
-            f"  │ {'':>5}  {'ms':>8}  {'ms':>8}  {'ms':>8}  "
-            f"{'ms':>8}  {'ms':>8}  {'ms':>8}  │"
+            f"  │ {'':>5}  {'ms':>8}  {'ms':>8}  "
+            f"{'ms':>8}  {'ms':>8}  {'ms':>8}  {'ms':>8}  │"
         )
         print(f"  │ " + "─" * 73 + " │")
 
@@ -1188,8 +1188,52 @@ def run_decode():
             else:
                 results["flash"] = float("nan")
 
-            # 6. FlashInfer — skip (API mismatch for decode scenario)
-            results["FlashInf"] = float("nan")
+            # 6. FlashInfer sparse (prefill API with custom_mask)
+            if HAS_FLASHINFER:
+                try:
+                    # FlashInfer expects [qo_len, num_heads, head_dim] NHD layout
+                    q_fi = q.squeeze(0).transpose(0, 1).contiguous()  # [q_len, H, D]
+                    k_fi = (
+                        k_cache.squeeze(0).transpose(0, 1).contiguous()
+                    )  # [kv_len, H, D]
+                    v_fi = v_cache.squeeze(0).transpose(0, 1).contiguous()
+                    # custom_mask: [q_len, kv_len] bool
+                    fi_mask = torch.zeros(
+                        q_len, kv_len, dtype=torch.bool, device=device
+                    )
+                    fi_idx = (
+                        indices[0, 0].unsqueeze(0).expand(q_len, -1)
+                    )  # [q_len, num_attend]
+                    fi_mask.scatter_(-1, fi_idx, True)
+                    results["FI_spr"] = lat_or_nan(
+                        lambda: fi_single_prefill(q_fi, k_fi, v_fi, custom_mask=fi_mask)
+                    )
+                except Exception:
+                    results["FI_spr"] = float("nan")
+            else:
+                results["FI_spr"] = float("nan")
+
+            # 7. FlashInfer dense (decode API for q_len=1, prefill for q_len>1)
+            if HAS_FLASHINFER:
+                try:
+                    from flashinfer import single_decode_with_kv_cache as fi_decode
+
+                    q_fi = q.squeeze(0).transpose(0, 1).contiguous()
+                    k_fi = k_cache.squeeze(0).transpose(0, 1).contiguous()
+                    v_fi = v_cache.squeeze(0).transpose(0, 1).contiguous()
+                    if q_len == 1:
+                        q_fi_1 = q_fi.squeeze(0)  # [H, D]
+                        results["FI_dns"] = lat_or_nan(
+                            lambda: fi_decode(q_fi_1, k_fi, v_fi)
+                        )
+                    else:
+                        results["FI_dns"] = lat_or_nan(
+                            lambda: fi_single_prefill(q_fi, k_fi, v_fi)
+                        )
+                except Exception:
+                    results["FI_dns"] = float("nan")
+            else:
+                results["FI_dns"] = float("nan")
 
             # Find fastest
             valid = {k: v for k, v in results.items() if not math.isnan(v)}
@@ -1197,8 +1241,9 @@ def run_decode():
 
             print(
                 f"  │ {q_len:>5}  {fmt(results['Gather'])}  {fmt(results['PyRef'])}  "
-                f"{fmt(results.get('Ours', float('nan')))}  {fmt(results['cuDNN'])}  "
-                f"{fmt(results['flash'])}  {fmt(results.get('FlashInf', float('nan')))}  "
+                f"{fmt(results['cuDNN'])}  {fmt(results['flash'])}  "
+                f"{fmt(results.get('FI_spr', float('nan')))}  "
+                f"{fmt(results.get('FI_dns', float('nan')))}  "
                 f"│ {fastest}"
             )
 
@@ -1212,14 +1257,15 @@ def run_decode():
 
     # ── Summary ─────────────────────────────────────────────────
     print("  注释:")
-    print("    Gather   = PyTorch gather + 小矩阵乘 (只加载 2048 个 KV, O(num_attend))")
-    print("    PyRef    = PyTorch Q×K^T + mask + softmax + ×V (加载全部 KV, O(kv_len))")
-    print(
-        "    Ours     = 我们的 CUDA prefill kernel (Q padded 到 kv_len, 计算 N×N, O(kv_len²))"
-    )
-    print("    cuDNN    = cuDNN SDPA dense (attend all, O(kv_len))")
-    print("    flash    = flash-attn dense (attend all, O(kv_len))")
-    print("    FlashInf = FlashInfer dense (attend all, O(kv_len))")
+    print("    Gather  = PyTorch gather + 小矩阵乘 (只加载 2048 个 KV, O(num_attend))")
+    print("    PyRef   = PyTorch Q×K^T + mask + softmax + ×V (加载全部 KV, O(kv_len))")
+    print("    cuDNN   = cuDNN SDPA dense (attend all, O(kv_len))")
+    print("    flash   = flash-attn dense (attend all, O(kv_len))")
+    print("    FI_spr  = FlashInfer single_prefill + custom_mask (sparse, O(kv_len))")
+    print("    FI_dns  = FlashInfer single_decode (dense, O(kv_len))")
+    print()
+    print("    Gather 是 O(num_attend) — 常数时间，不随 kv_len 增长")
+    print("    其余均为 O(kv_len) — 线性增长（即使有 mask 也要扫描全部 KV）")
     print()
     print("    Gather 是 O(num_attend) — 常数时间，不随 kv_len 增长")
     print("    PyRef/cuDNN/flash/FlashInfer 是 O(kv_len) — 线性增长")
