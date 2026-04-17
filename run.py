@@ -976,6 +976,180 @@ def run_compare():
 
 
 # ============================================================
+# Decode 场景测试
+# ============================================================
+
+
+def sparse_decode_gather(q, k_cache, v_cache, indices, scale):
+    """
+    Sparse decode via gather: only attend to indexed KV positions.
+    q:       [B, H, q_len, D]
+    k_cache: [B, H, kv_len, D]
+    v_cache: [B, H, kv_len, D]
+    indices: [B, H, q_len, num_attend]  — per-query attended position indices
+    """
+    B, H, q_len, D = q.shape
+    num_attend = indices.shape[-1]
+
+    # Gather K/V at sparse positions: [B, H, q_len, num_attend, D]
+    idx_expand = indices.unsqueeze(-1).expand(B, H, q_len, num_attend, D)
+    k_sel = torch.gather(
+        k_cache.unsqueeze(2).expand(-1, -1, q_len, -1, -1), 3, idx_expand
+    )
+    v_sel = torch.gather(
+        v_cache.unsqueeze(2).expand(-1, -1, q_len, -1, -1), 3, idx_expand
+    )
+
+    # Attention: Q[q_len, D] × K_sel[q_len, num_attend, D]^T → [q_len, num_attend]
+    scores = torch.einsum("bhqd,bhqkd->bhqk", q, k_sel) * scale
+    attn = torch.softmax(scores, dim=-1)
+    out = torch.einsum("bhqk,bhqkd->bhqd", attn, v_sel)
+    return out
+
+
+def sparse_decode_flat(q, k_cache, v_cache, indices_flat, scale):
+    """
+    Optimized sparse decode: shared indices across queries.
+    q:            [B, H, q_len, D]
+    k_cache:      [B, H, kv_len, D]
+    v_cache:      [B, H, kv_len, D]
+    indices_flat: [B, H, num_attend]  — shared across q_len queries
+    """
+    B, H, q_len, D = q.shape
+    num_attend = indices_flat.shape[-1]
+
+    # Gather K/V: [B, H, num_attend, D]
+    idx_exp = indices_flat.unsqueeze(-1).expand(B, H, num_attend, D)
+    k_sel = torch.gather(k_cache, 2, idx_exp)
+    v_sel = torch.gather(v_cache, 2, idx_exp)
+
+    # Q[B,H,q_len,D] × K_sel[B,H,num_attend,D]^T → [B,H,q_len,num_attend]
+    scores = torch.matmul(q, k_sel.transpose(-2, -1)) * scale
+    attn = torch.softmax(scores, dim=-1)
+    out = torch.matmul(attn, v_sel)
+    return out
+
+
+def dense_decode_sdpa(q, k_cache, v_cache):
+    """Dense decode via cuDNN SDPA (attends to all KV positions)."""
+    return torch.nn.functional.scaled_dot_product_attention(q, k_cache, v_cache)
+
+
+def dense_decode_flash(q, k_cache, v_cache):
+    """Dense decode via flash-attn (attends to all KV positions)."""
+    # flash-attn expects [B, N, H, D]
+    out = _flash_attn_func(
+        q.transpose(1, 2).contiguous(),
+        k_cache.transpose(1, 2).contiguous(),
+        v_cache.transpose(1, 2).contiguous(),
+        causal=False,  # decode: q attends to all past, no causal needed on q side
+    )
+    return out.transpose(1, 2)
+
+
+def run_decode():
+    """
+    Decode 场景测试：Q 长度 1-4，KV cache 长度 4K-128K。
+    对比 sparse gather (attend 2048) vs dense (attend all)。
+    """
+    print("=" * 100)
+    print("Decode 场景测试 — Sparse Gather vs Dense Full Attention")
+    print("=" * 100)
+    print("  Q: 新生成的 token (1=标准decode, 2-4=MTP 场景)")
+    print("  KV: 已有的 KV cache")
+    print("  Sparse: 每个 query 只 attend 2048 个随机 KV 位置")
+    print("  Dense: 每个 query attend 全部 KV 位置")
+    print()
+
+    B = 1
+    H = 12
+    D = 64
+    dtype = torch.float16
+    device = "cuda"
+    num_attend = 2048
+    q_lens = [1, 2, 3, 4]
+    kv_lens = [4096, 16384, 65536, 131072]
+
+    scale = 1.0 / math.sqrt(D)
+
+    # Header
+    print(f"  B={B}, H={H}, D={D}, num_attend={num_attend}, dtype=FP16")
+    print()
+    print(
+        f"  {'kv_len':>8}  {'q_len':>5}  {'Sparse(ms)':>11}  {'cuDNN(ms)':>10}  "
+        f"{'flash(ms)':>10}  {'Speedup_cuDNN':>13}  {'Speedup_flash':>13}  "
+        f"{'Sparse/Dense':>12}"
+    )
+    print("  " + "-" * 96)
+
+    for kv_len in kv_lens:
+        k_cache = torch.randn(B, H, kv_len, D, device=device, dtype=dtype)
+        v_cache = torch.randn(B, H, kv_len, D, device=device, dtype=dtype)
+
+        for q_len in q_lens:
+            q = torch.randn(B, H, q_len, D, device=device, dtype=dtype)
+
+            # Sparse indices: each query attends to num_attend random KV positions
+            indices = torch.randint(
+                0, kv_len, (B, H, min(num_attend, kv_len)), device=device
+            )
+
+            # Sparse decode
+            try:
+                lat_sp = measure_latency(
+                    lambda: sparse_decode_flat(q, k_cache, v_cache, indices, scale),
+                    warmup=20,
+                    repeat=100,
+                )
+            except Exception:
+                lat_sp = float("nan")
+
+            # Dense: cuDNN SDPA
+            try:
+                lat_cudnn = measure_latency(
+                    lambda: dense_decode_sdpa(q, k_cache, v_cache),
+                    warmup=20,
+                    repeat=100,
+                )
+            except Exception:
+                lat_cudnn = float("nan")
+
+            # Dense: flash-attn
+            if HAS_FLASH_ATTN:
+                try:
+                    lat_flash = measure_latency(
+                        lambda: dense_decode_flash(q, k_cache, v_cache),
+                        warmup=20,
+                        repeat=100,
+                    )
+                except Exception:
+                    lat_flash = float("nan")
+            else:
+                lat_flash = float("nan")
+
+            # Compute speedups
+            sp_cudnn = lat_cudnn / lat_sp if lat_sp > 0 else float("nan")
+            sp_flash = lat_flash / lat_sp if lat_sp > 0 else float("nan")
+            density = min(num_attend, kv_len) / kv_len * 100
+
+            print(
+                f"  {kv_len:>8}  {q_len:>5}  {lat_sp:>10.3f}  {lat_cudnn:>9.3f}  "
+                f"{lat_flash:>9.3f}  {sp_cudnn:>12.2f}×  {sp_flash:>12.2f}×  "
+                f"attend {density:.1f}%"
+            )
+
+        del k_cache, v_cache
+        torch.cuda.empty_cache()
+        print()
+
+    print("  说明:")
+    print("    Speedup >1 表示 sparse 更快，<1 表示 dense 更快")
+    print("    Sparse/Dense 列显示 sparse attend 的 KV 占比")
+    print("    MTP (Multi-Token Prediction): q_len>1 表示同时解码多个 token")
+    print()
+
+
+# ============================================================
 # 入口
 # ============================================================
 
@@ -984,7 +1158,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--mode", choices=["correctness", "perf", "all", "compare"], default="all"
+        "--mode",
+        choices=["correctness", "perf", "all", "compare", "decode"],
+        default="all",
     )
     args = parser.parse_args()
 
@@ -994,3 +1170,5 @@ if __name__ == "__main__":
         run_perf()
     if args.mode == "compare":
         run_compare()
+    if args.mode == "decode":
+        run_decode()
