@@ -124,38 +124,18 @@ __global__ __launch_bounds__(NWARPS * 32, 2) void sparse_attn_wmma_fp16(
     __half* K_buf = Q_s + BM * D;                                  // [2, BN_TILE, D]
     __half* V_buf = K_buf + 2 * BN_TILE * D;                       // [2, BN_TILE, D]
 
-    /* -------- fragment row AND column mapping -------- */
-    __half* tmpA = Q_s;
-    __half* tmpB = Q_s + 256;
-    for (int i = threadIdx.x; i < 256; i += blockDim.x) {
-        int r = i / 16, c = i % 16;
-        tmpA[i] = __float2half((r == c) ? 1.0f : 0.0f);
-        tmpB[i] = __float2half((float)(r * 16 + c));  // encode row*16+col
-    }
-    __syncthreads();
-
-    int elem_rows[8], elem_cols[8];
-    {
-        wmma::fragment<wmma::matrix_a, WM, WMMA_N, WK, __half, wmma::row_major> mA;
-        wmma::fragment<wmma::matrix_b, WM, WMMA_N, WK, __half, wmma::row_major> mB;
-        wmma::fragment<wmma::accumulator, WM, WMMA_N, WK, float> mC;
-        wmma::load_matrix_sync(mA, tmpA, 16);
-        wmma::load_matrix_sync(mB, tmpB, 16);
-        wmma::fill_fragment(mC, 0.0f);
-        wmma::mma_sync(mC, mA, mB, mC);
-        #pragma unroll
-        for (int i = 0; i < 8; i++) {
-            int val = __float2int_rn(mC.x[i]);
-            elem_rows[i] = val / 16;
-            elem_cols[i] = val % 16;
-        }
-    }
-    // Identify unique rows for this thread (for alpha shuffle + running state)
-    int my_r0 = elem_rows[0], my_r1 = my_r0;
-    for (int i = 1; i < 8; i++) {
-        if (elem_rows[i] != my_r0) { my_r1 = elem_rows[i]; break; }
-    }
-    __syncthreads();
+    /* -------- hardcoded WMMA fragment layout (verified for sm_90) -------- */
+    // Accumulator and matrix_a share the same layout:
+    //   Thread t: group g=t/4, lane l=t%4
+    //   x[i] maps to (row, col) where:
+    //     row = g (i∈{0,1,4,5}) or g+8 (i∈{2,3,6,7})  →  (i>>1)&1 selects +8
+    //     col = l*2 + (i&1) + (i>=4 ? 8 : 0)
+    //   matrix_a x[8..15] = x[0..7] (duplicated for m16n16k16 = 2× m16n8k16)
+    const int g = lane_id / 4;         // group index (0-7)
+    const int l = lane_id % 4;         // lane in group (0-3)
+    const int my_r0 = g;               // first row
+    const int my_r1 = g + 8;           // second row
+    const int c_base = l * 2;          // column base
 
     /* -------- load Q -------- */
     {
@@ -240,21 +220,23 @@ __global__ __launch_bounds__(NWARPS * 32, 2) void sparse_attn_wmma_fp16(
 
         #pragma unroll
         for (int i = 0; i < 8; i++) {
-            // S_left: actual column = elem_cols[i] (0-15)
-            int col_l = elem_cols[i];
-            uint32_t mw = (elem_rows[i] == my_r0) ? mword_r0 : mword_r1;
-            int gr = (elem_rows[i] == my_r0) ? grow_r0 : grow_r1;
+            int is_r1 = (i >> 1) & 1;  // 0 for i∈{0,1,4,5}, 1 for i∈{2,3,6,7}
+            uint32_t mw = is_r1 ? mword_r1 : mword_r0;
+            int gr = is_r1 ? grow_r1 : grow_r0;
+            int col_l = c_base + ((i & 4) ? 8 : 0) + (i & 1);
+
+            // S_left: actual column = col_l (0-15)
             bool ok = (gr < N) && (col_l < tlen) && ((mw >> col_l) & 1u);
             S_left.x[i] = ok ? S_left.x[i] : -FLT_MAX;
-            if (elem_rows[i] == my_r0) max_r0 = fmaxf(max_r0, S_left.x[i]);
-            else                        max_r1 = fmaxf(max_r1, S_left.x[i]);
+            if (is_r1) max_r1 = fmaxf(max_r1, S_left.x[i]);
+            else        max_r0 = fmaxf(max_r0, S_left.x[i]);
 
-            // S_right: actual column = elem_cols[i] + 16
+            // S_right: actual column = col_l + 16
             int col_r = col_l + 16;
             ok = (gr < N) && (col_r < tlen) && ((mw >> col_r) & 1u);
             S_right.x[i] = ok ? S_right.x[i] : -FLT_MAX;
-            if (elem_rows[i] == my_r0) max_r0 = fmaxf(max_r0, S_right.x[i]);
-            else                        max_r1 = fmaxf(max_r1, S_right.x[i]);
+            if (is_r1) max_r1 = fmaxf(max_r1, S_right.x[i]);
+            else        max_r0 = fmaxf(max_r0, S_right.x[i]);
         }
 
         // Reduce max across 4 threads in octet (XOR 1 + XOR 2)
@@ -275,7 +257,7 @@ __global__ __launch_bounds__(NWARPS * 32, 2) void sparse_attn_wmma_fp16(
         for (int d = 0; d < D_CHUNKS; d++) {
             #pragma unroll
             for (int i = 0; i < 8; i++)
-                O_acc[d].x[i] *= (elem_rows[i] == my_r0) ? alpha_r0 : alpha_r1;
+                O_acc[d].x[i] *= ((i >> 1) & 1) ? alpha_r1 : alpha_r0;
         }
 
         // Compute exp, accumulate sum, construct P fragments directly in registers
@@ -284,22 +266,19 @@ __global__ __launch_bounds__(NWARPS * 32, 2) void sparse_attn_wmma_fp16(
 
         #pragma unroll
         for (int i = 0; i < 8; i++) {
-            float nm;
-            int row_local;
+            int is_r1 = (i >> 1) & 1;
+            float nm = is_r1 ? new_max_r1 : new_max_r0;
 
             // S_left → Pl
-            row_local = elem_rows[i];
-            nm = (row_local == my_r0) ? new_max_r0 : new_max_r1;
             float p_l = (S_left.x[i] > -FLT_MAX) ? expf(S_left.x[i] - nm) : 0.0f;
-            if (row_local == my_r0) sum_r0 += p_l; else sum_r1 += p_l;
+            if (is_r1) sum_r1 += p_l; else sum_r0 += p_l;
             __half h_l = __float2half(p_l);
             Pl.x[i] = h_l;
-            Pl.x[i + 8] = h_l;  // matrix_a layout: elements 8-15 duplicate 0-7
+            Pl.x[i + 8] = h_l;
 
             // S_right → Pr
-            nm = (row_local == my_r0) ? new_max_r0 : new_max_r1;
             float p_r = (S_right.x[i] > -FLT_MAX) ? expf(S_right.x[i] - nm) : 0.0f;
-            if (row_local == my_r0) sum_r0 += p_r; else sum_r1 += p_r;
+            if (is_r1) sum_r1 += p_r; else sum_r0 += p_r;
             __half h_r = __float2half(p_r);
             Pr.x[i] = h_r;
             Pr.x[i + 8] = h_r;
@@ -345,10 +324,11 @@ __global__ __launch_bounds__(NWARPS * 32, 2) void sparse_attn_wmma_fp16(
     for (int d = 0; d < D_CHUNKS; d++) {
         #pragma unroll
         for (int i = 0; i < 8; i++) {
-            int r = row_start + elem_rows[i];
-            int c = d * WMMA_N + elem_cols[i];
+            int is_r1 = (i >> 1) & 1;
+            int r = row_start + (is_r1 ? my_r1 : my_r0);
+            int c = d * WMMA_N + c_base + ((i & 4) ? 8 : 0) + (i & 1);
             if (r < N) {
-                float inv = (elem_rows[i] == my_r0) ? my_inv_r0 : my_inv_r1;
+                float inv = is_r1 ? my_inv_r1 : my_inv_r0;
                 Out[bhND + r * D + c] = __float2half(O_acc[d].x[i] * inv);
             }
         }

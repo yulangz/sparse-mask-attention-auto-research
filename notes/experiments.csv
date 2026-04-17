@@ -35,3 +35,4 @@ round,optimization,latency_ms,tflops,mfu_pct,accepted,notes
 32,NWARPS=16 (BM=256 1 block/SM),20.818,,,,no gain over NWARPS=8+2blocks; slightly worse scheduling; reverted
 33,eliminate P_s smem (direct register P fragment),21.225,38.85,33.8,yes,kernel 19.2ms BEATS Triton (20.4ms)! acc==mat_a layout identity; 20.9x vs baseline
 34,BN_TILE=192 (max for 2 blocks/SM),21.049,39.18,34.1,yes,kernel 19.07ms; total 21.05ms; 21.1x vs baseline
+35,hardcoded WMMA layout (eliminate probe + arrays),20.819,39.61,34.5,yes,kernel 18.84ms! 118 regs 0 spills; 7.6% faster than Triton; 21.4x vs baseline
